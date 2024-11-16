@@ -1,0 +1,37 @@
+# clusterctl.yaml
+---
+# Define the infrastructure provider - OpenStack
+providers:
+  - name: "openstack"
+    url: "https://github.com/kubernetes-sigs/cluster-api-provider-openstack/releases/latest/infrastructure-components.yaml"
+    type: "InfrastructureProvider"
+
+# Bootstrap provider
+  - name: "kubeadm"
+    url: "https://github.com/kubernetes-sigs/cluster-api/releases/latest/bootstrap-components.yaml"
+    type: "BootstrapProvider"
+
+# Core provider
+  - name: "cluster-api"
+    url: "https://github.com/kubernetes-sigs/cluster-api/releases/latest/core-components.yaml"
+    type: "CoreProvider"
+
+# Control plane provider
+  - name: "kubeadm"
+    url: "https://github.com/kubernetes-sigs/cluster-api/releases/latest/control-plane-components.yaml"
+    type: "ControlPlaneProvider"
+
+# Variable configuration
+# Set up variables for interacting with OpenStack
+variables:
+  OPENSTACK_CLOUD: "default"           # OpenStack cloud name (matches the name in your clouds.yaml)
+  OPENSTACK_CLOUD_CREDENTIALS: "/path/to/clouds.yaml"  # Path to OpenStack credentials file
+  OPENSTACK_IMAGE_NAME: "ubuntu-20.04" # Image name to use for cluster nodes
+  OPENSTACK_SSH_KEY_NAME: "my-ssh-key" # Name of the SSH key in OpenStack
+  OPENSTACK_NETWORK_NAME: "default"    # OpenStack network name
+  OPENSTACK_SUBNET_NAME: "subnet"      # Subnet name for OpenStack network
+  OPENSTACK_CONTROL_PLANE_MACHINE_FLAVOR: "m1.medium" # Flavor for control plane nodes
+  OPENSTACK_NODE_MACHINE_FLAVOR: "m1.small"           # Flavor for worker nodes
+  OPENSTACK_REGION: "RegionOne"       # OpenStack region (adjust as needed)
+  OPENSTACK_PROJECT_ID: "my-project-id" # Project ID in OpenStack
+  OPENSTACK_DNS_NAMESERVERS: "8.8.8.8,8.8.4.4" # DNS servers for the cluster
