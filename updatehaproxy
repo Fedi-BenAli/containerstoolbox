@@ -1,0 +1,117 @@
+#!/bin/bash
+
+# Configuration
+AUTH_URL="https://openstack.example.com:5000/v3" # Replace with your OpenStack Auth URL
+USERNAME="your_username"                        # OpenStack username
+PASSWORD="your_password"                        # OpenStack password
+PROJECT_NAME="your_project_name"                # OpenStack project name
+NETWORK_NAME="your_network_name"                # OpenStack network name
+HAPROXY_CONFIG="/etc/haproxy/haproxy.cfg"
+BACKEND_NAME="backend_nodes"
+HAPROXY_RESTART_CMD="systemctl reload haproxy"
+
+# Function to log messages
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
+}
+
+# Step 1: Authenticate with OpenStack
+log "Authenticating with OpenStack API..."
+AUTH_RESPONSE=$(curl -s -X POST "$AUTH_URL/auth/tokens" \
+    -H "Content-Type: application/json" \
+    -d "{
+          \"auth\": {
+            \"identity\": {
+              \"methods\": [\"password\"],
+              \"password\": {
+                \"user\": {
+                  \"name\": \"$USERNAME\",
+                  \"domain\": { \"name\": \"default\" },
+                  \"password\": \"$PASSWORD\"
+                }
+              }
+            },
+            \"scope\": {
+              \"project\": {
+                \"name\": \"$PROJECT_NAME\",
+                \"domain\": { \"name\": \"default\" }
+              }
+            }
+          }
+        }")
+
+TOKEN=$(echo "$AUTH_RESPONSE" | jq -r '.token.id')
+PROJECT_ID=$(echo "$AUTH_RESPONSE" | jq -r '.token.project.id')
+
+if [[ -z "$TOKEN" ]]; then
+    log "Authentication failed. Check your credentials."
+    exit 1
+fi
+
+log "Authentication successful. Token obtained."
+
+# Step 2: Get network ID for the specified network
+log "Fetching network ID for network '$NETWORK_NAME'..."
+NETWORK_ID=$(curl -s -X GET "$AUTH_URL/networks" \
+    -H "X-Auth-Token: $TOKEN" \
+    | jq -r ".networks[] | select(.name==\"$NETWORK_NAME\") | .id")
+
+if [[ -z "$NETWORK_ID" ]]; then
+    log "Network '$NETWORK_NAME' not found."
+    exit 1
+fi
+
+log "Network ID for '$NETWORK_NAME': $NETWORK_ID"
+
+# Step 3: Fetch instance IPs
+log "Fetching instance IPs for project '$PROJECT_NAME' on network '$NETWORK_NAME'..."
+INSTANCES=$(curl -s -X GET "$AUTH_URL/servers" \
+    -H "X-Auth-Token: $TOKEN" \
+    -H "X-Project-ID: $PROJECT_ID")
+
+INSTANCE_IPS=$(echo "$INSTANCES" | jq -r ".servers[] | .addresses.\"$NETWORK_NAME\"[] | .addr")
+
+if [[ -z "$INSTANCE_IPS" ]]; then
+    log "No instances found on network '$NETWORK_NAME'."
+    exit 1
+fi
+
+log "Found instance IPs: $INSTANCE_IPS"
+
+# Step 4: Generate HAProxy backend configuration
+backend_config="backend $BACKEND_NAME
+    balance roundrobin
+    option httpchk HEAD / HTTP/1.1\r\nHost:\ localhost
+    http-check expect status 200
+"
+
+index=1
+for ip in $INSTANCE_IPS; do
+    backend_config+="    server node${index} ${ip}:80 check\n"
+    index=$((index + 1))
+done
+
+log "Generated backend configuration:
+$backend_config"
+
+# Step 5: Update HAProxy configuration
+log "Updating HAProxy configuration at $HAPROXY_CONFIG..."
+
+if grep -q "backend $BACKEND_NAME" "$HAPROXY_CONFIG"; then
+    # Remove old backend configuration
+    sed -i "/backend $BACKEND_NAME/,/^$/d" "$HAPROXY_CONFIG"
+fi
+
+# Append new backend configuration
+echo -e "\n$backend_config" >> "$HAPROXY_CONFIG"
+
+# Step 6: Reload HAProxy
+log "Reloading HAProxy..."
+if $HAPROXY_RESTART_CMD; then
+    log "HAProxy reloaded successfully."
+else
+    log "Failed to reload HAProxy. Check the configuration for errors."
+    exit 1
+fi
+
+log "HAProxy backend configuration updated and reloaded successfully."
