@@ -1,0 +1,107 @@
+#!/bin/bash
+
+# OpenStack API credentials
+KEYSTONE_URL="http://<keystone-url>/v3/auth/tokens"  # Replace with your Keystone URL
+OS_USERNAME="admin"  # Replace with your OpenStack username
+OS_PASSWORD="your_password"  # Replace with your OpenStack password
+OS_PROJECT_NAME="admin"  # Replace with your OpenStack project name
+OS_DOMAIN_ID="default"  # Replace with your OpenStack domain ID
+
+# HAProxy configuration files
+HAPROXY_CFG="/etc/haproxy/haproxy.cfg"
+BACKEND_CFG="/etc/haproxy/backends.cfg"  # Temporary backend configuration file
+HAPROXY_SERVICE="haproxy"  # HAProxy service name
+
+# Function to authenticate and get the token
+get_openstack_token() {
+    echo "Authenticating with OpenStack..."
+    TOKEN=$(curl -s -X POST \
+      -H "Content-Type: application/json" \
+      -d "{
+            \"auth\": {
+              \"identity\": {
+                \"methods\": [\"password\"],
+                \"password\": {
+                  \"user\": {
+                    \"name\": \"$OS_USERNAME\",
+                    \"domain\": { \"id\": \"$OS_DOMAIN_ID\" },
+                    \"password\": \"$OS_PASSWORD\"
+                  }
+                }
+              },
+              \"scope\": {
+                \"project\": {
+                  \"name\": \"$OS_PROJECT_NAME\",
+                  \"domain\": { \"id\": \"$OS_DOMAIN_ID\" }
+                }
+              }
+            }
+          }" \
+      "$KEYSTONE_URL" | grep -i "X-Subject-Token" | awk '{print $2}' | tr -d '\r')
+    
+    if [ -z "$TOKEN" ]; then
+        echo "Failed to authenticate and retrieve token."
+        exit 1
+    fi
+
+    echo "Authentication successful, token: $TOKEN"
+}
+
+# Function to fetch the IP addresses of active VMs
+get_vm_ips() {
+    echo "Fetching active VM IP addresses..."
+
+    # Fetch list of active servers and extract their IP addresses using the token
+    VM_IPS=$(curl -s -X GET \
+        -H "X-Auth-Token: $TOKEN" \
+        "http://<nova-url>/v2.1/servers/detail" | \
+        jq -r '.servers[] | select(.status=="ACTIVE") | .addresses[] | .addr')
+
+    # Check if IPs were found
+    if [ -z "$VM_IPS" ]; then
+        echo "No active VMs found."
+        exit 1
+    fi
+
+    echo "Active VM IPs: $VM_IPS"
+}
+
+# Function to generate HAProxy backend configuration
+generate_haproxy_config() {
+    echo "Generating HAProxy backend configuration..."
+
+    # Start backend section
+    echo "backend k8s-control-planes" > $BACKEND_CFG
+    echo "    balance roundrobin" >> $BACKEND_CFG
+    echo "    option tcp-check" >> $BACKEND_CFG
+
+    # Add servers to the backend section
+    for IP in $VM_IPS; do
+        echo "    server vm-$IP $IP:6443 check" >> $BACKEND_CFG
+    done
+}
+
+# Function to update HAProxy configuration
+update_haproxy() {
+    echo "Updating HAProxy configuration..."
+
+    # Back up the existing HAProxy configuration
+    cp $HAPROXY_CFG $HAPROXY_CFG.bak
+
+    # Remove the old backend section from the HAProxy configuration
+    sed -i '/backend k8s-control-planes/,$d' $HAPROXY_CFG
+
+    # Append the new backend configuration
+    cat $BACKEND_CFG >> $HAPROXY_CFG
+
+    # Reload HAProxy to apply changes
+    systemctl reload $HAPROXY_SERVICE
+
+    echo "HAProxy has been reloaded."
+}
+
+# Main script execution
+get_openstack_token
+get_vm_ips
+generate_haproxy_config
+update_haproxy
