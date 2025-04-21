@@ -95,5 +95,7 @@ Explanation:
 
 Configuration Section:
 kubectl get nodes -l node-role.kubernetes.io/worker= -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}'
+kubectl get nodes -o jsonpath='{range .items[?(!@.metadata.labels["node-role.kubernetes.io/control-plane"] && !@.metadata.labels["node-role.kubernetes.io/master"])]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}'
+
 HAPROXY_CONFIG_FILE: Path to your HAProxy configuration file.
 BACKEND_
