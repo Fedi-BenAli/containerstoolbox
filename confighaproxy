@@ -1,0 +1,99 @@
+#!/bin/bash
+
+# --- Configuration ---
+HAPROXY_CONFIG_FILE="/etc/haproxy/haproxy.cfg"
+BACKEND_NAME="kubernetes_workers"  # Replace with your backend name in haproxy.cfg
+SERVER_PREFIX="worker_"           # Prefix for worker server lines
+KUBECTL_NAMESPACE=""              # Optional: Specify a namespace if needed
+HAPROXY_PID_FILE="/var/run/haproxy.pid" # Path to the HAProxy PID file
+# ---------------------
+
+# Function to check if a process is running based on its PID file
+is_process_running() {
+  if [ -f "$1" ] && kill -0 "$(cat "$1")" >/dev/null 2>&1; then
+    return 0 # Running
+  else
+    return 1 # Not running
+  fi
+}
+
+# Function to get Kubernetes worker node IPs
+get_worker_ips() {
+  local kubectl_cmd="kubectl get nodes -o jsonpath='{.items[?(.status.nodeInfo.kubeletEndpoint.port != null)].status.addresses[?(@.type == \"InternalIP\")].address}'"
+  if [ -n "$KUBECTL_NAMESPACE" ]; then
+    kubectl_cmd="$kubectl_cmd -n $KUBECTL_NAMESPACE"
+  fi
+  local ips
+  ips=$(eval "$kubectl_cmd")
+  echo "$ips" | tr -s ' ' '\n'
+}
+
+# Function to update the HAProxy configuration
+update_haproxy_config() {
+  local temp_config_file=$(mktemp)
+  local worker_ips
+
+  worker_ips=$(get_worker_ips)
+
+  sed "/^backend ${BACKEND_NAME}$/,/^end$/{
+    /^${SERVER_PREFIX}/d
+  }" "$HAPROXY_CONFIG_FILE" > "$temp_config_file"
+
+  echo "" >> "$temp_config_file"
+  echo "  backend ${BACKEND_NAME}" >> "$temp_config_file"
+  count=1
+  while IFS= read -r ip; do
+    server_name="${SERVER_PREFIX}${count}"
+    echo "    server ${server_name} ${ip}:10250 check" >> "$temp_config_file" # Assuming kubelet port is 10250
+    ((count++))
+  done <<< "$worker_ips"
+  echo "  end" >> "$temp_config_file"
+
+  # Replace the old config with the new one
+  mv "$temp_config_file" "$HAPROXY_CONFIG_FILE"
+  echo "HAProxy configuration updated with Kubernetes worker node IPs."
+}
+
+# Function to reload HAProxy gracefully
+reload_haproxy() {
+  if is_process_running "$HAPROXY_PID_FILE"; then
+    echo "Reloading HAProxy..."
+    haproxy -f "$HAPROXY_CONFIG_FILE" -p "$HAPROXY_PID_FILE" -sf "$(cat "$HAPROXY_PID_FILE")"
+    if [ $? -eq 0 ]; then
+      echo "HAProxy reloaded successfully."
+    else
+      echo "Error reloading HAProxy."
+    fi
+  else
+    echo "HAProxy is not running. Please start it manually after updating the configuration."
+  fi
+}
+
+# --- Main Script ---
+
+if [ ! -f "$HAPROXY_CONFIG_FILE" ]; then
+  echo "Error: HAProxy configuration file not found at $HAPROXY_CONFIG_FILE"
+  exit 1
+fi
+
+if ! command -v haproxy &> /dev/null; then
+  echo "Error: HAProxy command not found. Please ensure it's installed and in your PATH."
+  exit 1
+fi
+
+if ! command -v kubectl &> /dev/null; then
+  echo "Error: kubectl command not found. Please ensure it's installed and in your PATH and configured to access your cluster."
+  exit 1
+fi
+
+update_haproxy_config
+
+reload_haproxy
+
+exit 0
+Explanation:
+
+Configuration Section:
+
+HAPROXY_CONFIG_FILE: Path to your HAProxy configuration file.
+BACKEND_
