@@ -94,6 +94,6 @@ exit 0
 Explanation:
 
 Configuration Section:
-
+kubectl get nodes -l node-role.kubernetes.io/worker= -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}'
 HAPROXY_CONFIG_FILE: Path to your HAProxy configuration file.
 BACKEND_
