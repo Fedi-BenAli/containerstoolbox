@@ -1,6 +1,6 @@
 #!/bin/bash
 
-echo "Checking EgressIP assignments..."
+echo "Checking EgressIP assignments (expecting 2 nodes)..."
 echo
 
 oc get egressip -o json | jq -r '
@@ -12,10 +12,9 @@ oc get egressip -o json | jq -r '
     | select(. != null)
   )
 } |
-.group_by(.name)[] |
-{
-  name: .[0].name,
-  nodes: ([.[].nodes] | unique)
-} |
-select(.nodes | length != 2) |
-"EgressIP \(.name) is assigned to \(.nodes | length) node(s): \(.nodes | join(", "))"
+.name as $name |
+.nodes as $nodes |
+[$nodes] |
+unique |
+select(length != 2) |
+"EgressIP " + $name + " is assigned to " + (length|tostring) + " node(s)"
