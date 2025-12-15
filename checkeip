@@ -1,0 +1,33 @@
+#!/bin/bash
+
+tmpfile=$(mktemp)
+
+# Collect br-ex IPv4 addresses from all worker nodes
+oc get nodes -l node-role.kubernetes.io/worker -o name | while read node; do
+  oc debug "$node" -- chroot /host ip -4 addr show br-ex 2>/dev/null \
+    | awk -v n="$node" '/inet / {print $2, n}' >> "$tmpfile"
+done
+
+echo
+echo "=== All br-ex IPs collected ==="
+column -t "$tmpfile"
+
+echo
+echo "=== Duplicated IPs and affected nodes ==="
+
+awk '
+{
+  ip=$1
+  node=$2
+  ips[ip]=ips[ip] " " node
+  count[ip]++
+}
+END {
+  for (ip in count) {
+    if (count[ip] > 1) {
+      printf "IP %s is duplicated on nodes:%s\n", ip, ips[ip]
+    }
+  }
+}' "$tmpfile"
+
+rm -f "$tmpfile"
