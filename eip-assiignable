@@ -1,0 +1,21 @@
+#!/bin/bash
+
+echo "Checking EgressIP assignments..."
+echo
+
+oc get egressip -o json | jq -r '
+.items[] |
+{
+  name: .metadata.name,
+  nodes: (
+    .status.items[]?.egressIPs[]?.node
+    | select(. != null)
+  )
+} |
+.group_by(.name)[] |
+{
+  name: .[0].name,
+  nodes: ([.[].nodes] | unique)
+} |
+select(.nodes | length != 2) |
+"EgressIP \(.name) is assigned to \(.nodes | length) node(s): \(.nodes | join(", "))"
