@@ -1,0 +1,51 @@
+#!/bin/bash
+
+INTERFACE="br-ex"
+DRY_RUN="true"   # set to "false" to actually delete
+
+tmpfile=$(mktemp)
+
+echo "Collecting $INTERFACE IPv4 addresses from worker nodes..."
+
+oc get nodes -l node-role.kubernetes.io/worker -o name | while read node; do
+  oc debug "$node" -- chroot /host ip -4 addr show "$INTERFACE" 2>/dev/null \
+    | awk -v n="$node" '/inet / {print $2, n}' >> "$tmpfile"
+done
+
+echo
+echo "=== All br-ex IPs collected ==="
+column -t "$tmpfile"
+
+echo
+echo "=== Deleting duplicated IPs from ALL nodes ==="
+
+awk -v iface="$INTERFACE" -v dry="$DRY_RUN" '
+{
+  ip=$1
+  node=$2
+  nodes[ip]=nodes[ip] " " node
+  count[ip]++
+}
+END {
+  for (ip in count) {
+    if (count[ip] > 1) {
+      printf "\nIP %s is duplicated on:%s\n", ip, nodes[ip]
+
+      split(nodes[ip], nodelist, " ")
+      for (i in nodelist) {
+        node=nodelist[i]
+        if (node == "") continue
+
+        if (dry == "true") {
+          printf "  DRY-RUN delete %s from %s\n", ip, node
+        } else {
+          printf "  DELETE  %s from %s\n", ip, node
+          cmd="oc debug " node " -- chroot /host ip addr del " ip " dev " iface
+          system(cmd)
+        }
+      }
+    }
+  }
+}' "$tmpfile"
+
+rm -f "$tmpfile"
