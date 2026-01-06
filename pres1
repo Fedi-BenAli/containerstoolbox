@@ -1,0 +1,77 @@
+Presentation Title: OpenShift Infrastructure Optimization: Segmentation by NodeGroups
+Subtitle: Targeted Maintenance Strategy and Workload Isolation
+
+Slide 1: Introduction and Current Context
+Title: Our OpenShift Environment Today
+Content:
+Infrastructure: A robust single cluster consisting of 24 Worker Nodes.
+Current Situation: Workloads (Pods) are distributed randomly across all 24 nodes.
+The Challenge:
+Maintenance (updates, reboots) potentially impacts everyone unpredictably.
+Lack of visibility on "who is running where."
+"Noisy Neighbor" risk (one application consuming all resources impacts others).
+
+Slide 2: The New Strategy: NodeGroups
+Title: Segmentation into NodeGroups
+Suggested Visual: A diagram showing the 24-node cluster divided into 6 distinct blocks of 4 nodes each.
+Content:
+The Concept: Dividing our large cluster into logical and physical subsets called "NodeGroups."
+Sizing:
+Total Worker Nodes: 24
+NodeGroup Size: 4 Worker Nodes
+Total Capacity: 6 distinct NodeGroups.
+Immediate Benefit: Creating dedicated availability zones within the same cluster.
+
+Slide 3: Assignment Mechanism (The CIA Label)
+Title: How Will You Be Assigned?
+Suggested Visual: An arrow connecting a User Namespace to a NodeGroup via a tag/label.
+Content:
+The Unique Identifier: Usage of the label CIA=[Project_Name].
+The Rule: All namespaces (dev, test, prod environments) sharing the same CIA will be automatically directed to the same NodeGroup.
+Technique: Using OpenShift NodeSelectors and Taints/Tolerations to ensure your applications stay on your dedicated nodes.
+
+Slide 4: Benefits for Users ("The Why")
+Title: What's In It For You?
+Content:
+1. Predictable Maintenance:
+We only update one NodeGroup at a time.
+If your project is on NodeGroup A, maintenance on NodeGroup B does not affect you.
+Possibility to negotiate maintenance windows specific to your NodeGroup.
+2. Performance Isolation:
+Your resources (CPU/RAM) are guaranteed within your group.
+Load spikes from another project (different CIA) will not impact your applications.
+3. Increased Stability: Reduced blast radius in case of hardware incidents.
+
+Slide 5: Maintenance Scenario (Comparison)
+Title: Managing Service Downtime
+Comparison Table:
+Before (Flat Cluster):
+Cluster update = Risk of Pod restarts at any time.
+Coordination required with all users for even minor interventions.
+After (NodeGroups):
+Maintenance of NodeGroup 1 (Project Alpha) on Monday night.
+Maintenance of NodeGroup 2 (Project Beta) on Saturday morning.
+Result: You choose the slot that impacts your business activity the least.
+
+Slide 6: Impacts and Prerequisites
+Title: What Changes for Your Deployments
+Content:
+Transparency: For developers, interaction with the OpenShift API remains the same.
+Configuration:
+We (the Ops team) will apply the Project (Namespace) configurations for you.
+Your deployment files (YAML/Helm) generally do not need modification, unless you have specific hardcoded constraints.
+Capacity: Each project is limited to the power of 4 nodes (sufficient for High Availability), encouraging better resource management.
+
+Slide 7: Roadmap and Next Steps
+Title: Migration Schedule
+Content:
+Phase 1: Creation and labeling of NodeGroups (No impact).
+Phase 2: Pilot migration (First volunteer project).
+Phase 3: Progressive migration of other CIAs (Project by Project).
+Key Dates: [Insert your estimated dates here].
+
+Slide 8: Q&A
+Title: Thank You
+Content:
+Open floor for discussion.
+Infrastructure team contact details to schedule your migration.
