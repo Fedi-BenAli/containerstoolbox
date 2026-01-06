@@ -1,0 +1,97 @@
+Slide 1: Title
+Title: Workload Isolation Strategy for OpenShift Cluster
+Subtitle: "Predictable Maintenance Through Dedicated NodeGroups"
+Your Name/Team + Date (01/06/2026)  
+
+Slide 2: Current Challenges
+Current Setup:
+24 shared worker nodes across all users
+Cross-team disruptions during maintenance
+Unpredictable downtime for critical projects
+Goals:
+Isolate workloads by user/project groups
+Enable targeted maintenance windows
+Improve resource accountability
+
+Slide 3: Proposed Solution (Key Visual)
+Architecture Schematic:
+6 NodeGroups (4 nodes each)
+NodeGroups labeled CIA=<project>
+Namespaces → NodeGroups via label selectors (visual arrows)
+Tagline:
+"One NodeGroup = One User Group = One Maintenance Window"
+
+Slide 4: Technical Implementation (1/2)
+Core Mechanisms:
+NodeGroup creation (OpenShift MachineSets)
+Taints/Tolerations for isolation
+Node labels: nodegroup=<id>
+Namespace affinity rules
+Sample Configuration:
+yaml
+Copy
+nodeSelector:
+  nodegroup: "cia-projectx"
+tolerations:
+- key: "dedicated"
+  operator: "Equal"
+  value: "cia-projectx"
+  effect: "NoSchedule"
+Slide 5: Technical Implementation (2/2)
+Maintenance Workflow:
+Notify affected NodeGroup users
+Drain nodes: oc adm drain <node> --ignore-daemonsets
+Perform maintenance (upgrades, reboots)
+Verify pod rescheduling
+Reactivate nodes
+Benefits:
+75% smaller blast radius during maintenance
+Zero impact on unrelated NodeGroups
+Slide 6: User Impact
+New Requirements:
+Add CIA label to namespaces:
+bash
+Copy
+oc label namespace my-project CIA=projectx
+Monitor NodeGroup-specific quotas
+Unchanged Elements:
+Access to cluster-wide resources (storage, networking)
+Existing CI/CD pipelines
+Slide 7: Rollout Plan
+Phase 1 (Month 1):
+Create NodeGroups + monitoring dashboards
+Phase 2 (Month 2):
+Migrate high-priority projects (voluntary)
+Phase 3 (Month 3):
+Enforce taints/tolerations
+Phase 4 (Month 4):
+Mandatory node affinity policies
+Slide 8: Anticipated FAQs
+Q: What if a NodeGroup runs out of capacity?
+A: Automatic alerts + option to scale horizontally  
+
+Q: How to handle cross-project dependencies?
+A: Use shared NodeGroups with shared=true label  
+
+Q: Cost tracking?
+A: Monthly reports per NodeGroup + budget alerts  
+
+Slide 9: Next Steps
+Security review of isolation model
+Documentation portal creation
+Hands-on workshops for users
+Standardized project templates
+Slide 10: Conclusion
+Key Benefits:
+🛠️ Granular maintenance control
+📈 Improved resource forecasting
+🔒 Enhanced stability for critical workloads
+Call to Action:
+"First NodeGroups available on [date] – Schedule your migration!"
+Presentation Tips:  
+
+Add screenshots of NodeGroup configurations
+Include metrics comparing current vs. projected downtime
+Demo: Show namespace labeling → pod rescheduling
+Distribute quick-reference guides with key commands
+Need me to expand any section further? 💡
