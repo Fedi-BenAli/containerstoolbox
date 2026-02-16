@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# --- Configuration ---
+# 1. Detect if we should use oc or kubectl
+CLI="kubectl"
+if command -v oc &> /dev/null; then CLI="oc"; fi
+
+# 2. Namespace where OVN pods are running (usually openshift-ovn-kubernetes)
+NAMESPACE="openshift-ovn-kubernetes"
+
+# 3. Label selector for the OVN controller pods
+#    Common values: "app=ovnkube-node", "app=ovn-controller"
+LABEL_SELECTOR="app=ovnkube-node" 
+
+# 4. **IMPORTANT**: Name of the container within the OVN pod that runs ovn-nbctl
+#    Common values: "ovnkube-node", "ovn-controller", "northd"
+#    To find it: `kubectl -n openshift-ovn-kubernetes describe pod <ovn-pod-name>`
+#    and look under the 'Containers:' section.
+OVN_CONTAINER_NAME="ovnkube-node" 
+# ---------------------
+
+# Verify jq is installed
+if ! command -v jq &> /dev/null; then
+    echo "Error: 'jq' is not installed. Please install it (e.g., sudo yum install jq) to run this script." >&2
+    exit 1
+fi
+
+echo "Using $CLI to interact with the cluster."
+echo "Looking for OVN pods in namespace '$NAMESPACE' with selector '$LABEL_SELECTOR'."
+echo "Using container '$OVN_CONTAINER_NAME' within pods for ovn-nbctl commands."
+echo "---------------------------------------------------------"
+
+# Declare associative arrays to store IPs
+declare -A OVN_DISCOVERED_IPS  # Key: node_name, Value: "ip1 ip2 ip3"
+declare -A OC_REPORTED_IPS     # Key: node_name, Value: "ipA ipB ipC"
+declare -A ALL_NODES           # Key: node_name, Value: 1 (just to keep track of all involved nodes)
+
+# --- Part 1: Collect OVN Egress IPs per node ---
+echo "Phase 1/2: Collecting Egress IPs directly from OVN on each node..."
+
+# Get list of "PodName NodeName"
+PODS_NODES=$($CLI -n "$NAMESPACE" get pods -l "$LABEL_SELECTOR" --field-selector=status.phase=Running -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.nodeName}{"\n"}{end}' || true)
+
+if [[ -z "$PODS_NODES" ]]; then
+    echo "Error: No running OVN controller pods found with label '$LABEL_SELECTOR' in namespace '$NAMESPACE'." >&2
+    echo "Please check the NAMESPACE and LABEL_SELECTOR variables in the script." >&2
+    exit 1
+fi
+
+TOTAL_NODES=$(echo "$PODS_NODES" | wc -l)
+CURRENT_NODE_COUNT=0
+
+# Iterate through every line of "Pod Node"
+while read -r pod k8s_node_name; do
+    CURRENT_NODE_COUNT=$((CURRENT_NODE_COUNT+1))
+    
+    # Print progress to stderr so it doesn't mess up the final table if redirected
+    echo -ne "  Processing node [$CURRENT_NODE_COUNT/$TOTAL_NODES]: $k8s_node_name ...\r" >&2
+
+    # The router name standard in OVN-K is often GR_<kubernetes_node_name>
+    ROUTER_NAME="GR_${k8s_node_name}"
+
+    # Exec into the specific pod and container for that node
+    RAW_NAT=$($CLI -n "$NAMESPACE" exec "$pod" -c "$OVN_CONTAINER_NAME" -- \
+        ovn-nbctl lr-nat-list "$ROUTER_NAME" 2>/dev/null || true)
+
+    # Parse the output looking for external_ip
+    IPS=$(echo "$RAW_NAT" \
+        | grep -oP "external_ip:\K\S+" \
+        | sort -u \
+        | tr '\n' ' ' || true)
+
+    # Store results
+    OVN_DISCOVERED_IPS["$k8s_node_name"]="$IPS"
+    ALL_NODES["$k8s_node_name"]=1
+
+done <<< "$PODS_NODES"
+echo -e "\n  Finished collecting OVN Egress IPs."
+
+# --- Part 2: Collect OpenShift EgressIP CR IPs per node ---
+echo "Phase 2/2: Collecting EgressIP CR status from OpenShift API..."
+OC_EGRESSIPS_JSON=$($CLI get egressips -o json || echo "{}")
+
+if [[ "$OC_EGRESSIPS_JSON" == "{}" ]]; then
+    echo "Warning: No EgressIP custom resources found or accessible." >&2
+fi
+
+# Use jq to parse the JSON and extract node and egressIPs
+# Filter for entries where status.node and status.egressIP exist and are not empty
+OC_EGRESS_DATA=$(echo "$OC_EGRESSIPS_JSON" | jq -r '
+    .items[] | select(.status.node and .status.egressIP | length > 0) |
+    "\(.status.node) \(.status.egressIP[] | tostring)"
+')
+
+while read -r oc_node oc_ip; do
+    if [[ -n "$oc_node" && -n "$oc_ip" ]]; then
+        # Append IP to the node's list
+        OC_REPORTED_IPS["$oc_node"]="${OC_REPORTED_IPS["$oc_node"]} $oc_ip"
+        ALL_NODES["$oc_node"]=1
+    fi
+done <<< "$OC_EGRESS_DATA"
+
+# Clean up leading/trailing spaces from collected OC_REPORTED_IPS
+for node in "${!OC_REPORTED_IPS[@]}"; do
+    OC_REPORTED_IPS["$node"]="$(echo "${OC_REPORTED_IPS["$node"]}" | xargs)"
+done
+echo "  Finished collecting OpenShift EgressIP CR status."
+
+
+# --- Part 3: Compare and Report ---
+echo -e "\n--- Egress IP Comparison Report ---"
+echo "Legend:"
+echo "  [  OK  ] All IPs match between OVN and OpenShift CR status."
+echo "  [ WARN ] Discrepancy found: IPs present in one source but not the other."
+echo "  [ INFO ] No Egress IPs configured/reported for this node by one or both sources."
+echo "---------------------------------------------------------"
+
+# Iterate over all unique nodes found in either OVN or OpenShift data
+for node in "${!ALL_NODES[@]}"; do
+    ovn_ips_str="${OVN_DISCOVERED_IPS[$node]:-(none)}"
+    oc_ips_str="${OC_REPORTED_IPS[$node]:-(none)}"
+
+    # Convert space-separated strings to sorted, newline-separated lists for comm utility
+    # Filter out "(none)" to ensure correct set comparison
+    ovn_list=$(echo "$ovn_ips_str" | tr ' ' '\n' | grep -v '^\(none\)$' | sort -u)
+    oc_list=$(echo "$oc_ips_str" | tr ' ' '\n' | grep -v '^\(none\)$' | sort -u)
+
+    # Use 'comm' to find differences between the two sorted lists
+    # -1: suppress lines unique to FILE1
+    # -2: suppress lines unique to FILE2
+    # -3: suppress lines common to both files
+    
+    # Common IPs (present in both)
+    common_ips=$(comm -12 <(echo "$ovn_list") <(echo "$oc_list") | tr '\n' ' ' | xargs)
+    
+    # IPs only in OVN (configured on node, but not reported by OC CR)
+    ovn_only_ips=$(comm -23 <(echo "$ovn_list") <(echo "$oc_list") | tr '\n' ' ' | xargs)
+
+    # IPs only in OpenShift CR (reported by OC CR, but not configured on node)
+    oc_only_ips=$(comm -13 <(echo "$ovn_list") <(echo "$oc_list") | tr '\n' ' ' | xargs)
+
+    status_tag=""
+    if [[ -z "$ovn_only_ips" && -z "$oc_only_ips" ]]; then
+        if [[ -z "$common_ips" ]]; then
+            status_tag="[ INFO ]" # Both are effectively empty or "(none)"
+        else
+            status_tag="[  OK  ]" # All IPs found matched
+        fi
+    else
+        status_tag="[ WARN ]" # Discrepancy detected
+    fi
+
+    echo "$status_tag Node: $node"
+    echo "  OVN (actual)   : ${ovn_ips_str:-'(none)'}"
+    echo "  OC  (reported) : ${oc_ips_str:-'(none)'}"
+    if [[ -n "$ovn_only_ips" ]]; then
+        echo "  OVN only (configured on node, not reported by OC CR): ${ovn_only_ips}"
+    fi
+    if [[ -n "$oc_only_ips" ]]; then
+        echo "  OC only (reported by OC CR, not configured on node): ${oc_only_ips}"
+    fi
+    echo "---------------------------------------------------------"
+done
+
+echo -e "\nComparison complete." >&2
