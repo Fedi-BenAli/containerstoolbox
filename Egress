@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# 1. Setup CLI (oc or kubectl)
+CLI="kubectl"
+if command -v oc &> /dev/null; then CLI="oc"; fi
+
+NAMESPACE="openshift-ovn-kubernetes"
+LABEL_SELECTOR="app=ovnkube-node" 
+
+echo "Retrieving list of OVN pods..."
+# Get list of "PodName NodeName"
+PODS_NODES=$($CLI -n "$NAMESPACE" get pods -l "$LABEL_SELECTOR" --field-selector=status.phase=Running -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.nodeName}{"\n"}{end}')
+
+if [[ -z "$PODS_NODES" ]]; then
+    echo "Error: No running ovnkube-node pods found."
+    exit 1
+fi
+
+TOTAL=$(echo "$PODS_NODES" | wc -l)
+CURRENT=0
+
+echo "Scanning $TOTAL nodes for Egress IPs..."
+printf "%-30s | %s\n" "NODE" "EGRESS IP(s)"
+echo "---------------------------------------------------------"
+
+# 2. Iterate through every line of "Pod Node"
+while read -r pod node; do
+    CURRENT=$((CURRENT+1))
+    
+    # Print progress to stderr so it doesn't mess up the final table if redirected
+    echo -ne "Scanning [$CURRENT/$TOTAL]: $node ...\r" >&2
+
+    # The router name standard in OVN-K is GR_<node_name>
+    ROUTER_NAME="GR_${node}"
+
+    # 3. Exec into the specific pod for that node
+    # We use 'ovn-nbctl lr-nat-list' specifically for THAT node's router
+    # We suppress stderr in case the router doesn't exist yet on a new node
+    RAW_NAT=$($CLI -n "$NAMESPACE" exec "$pod" -c ovnkube-node -- \
+        ovn-nbctl lr-nat-list "$ROUTER_NAME" 2>/dev/null || true)
+
+    # 4. Parse the output looking for external_ip
+    IPS=$(echo "$RAW_NAT" \
+        | grep "external_ip" \
+        | awk '{print $2}' \
+        | cut -d: -f2 \
+        | sort -u \
+        | tr '\n' ' ')
+
+    if [[ -z "$IPS" ]]; then
+        printf "%-30s | %s\n" "$node" "(none)"
+    else
+        printf "%-30s | %s\n" "$node" "$IPS"
+    fi
+
+done <<< "$PODS_NODES"
+
+echo -e "\nDone." >&2
