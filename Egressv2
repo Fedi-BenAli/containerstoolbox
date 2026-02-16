@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# --- Configuration ---
+# 1. Detect if we should use oc or kubectl
+CLI="kubectl"
+if command -v oc &> /dev/null; then CLI="oc"; fi
+
+# 2. Namespace where OVN pods are running (usually openshift-ovn-kubernetes)
+NAMESPACE="openshift-ovn-kubernetes"
+
+# 3. Label selector for the OVN controller pods
+#    Common values: "app=ovnkube-node", "app=ovn-controller"
+LABEL_SELECTOR="app=ovnkube-node" 
+
+# 4. **IMPORTANT**: Name of the container within the OVN pod that runs ovn-nbctl
+#    Common values: "ovnkube-node", "ovn-controller", "northd"
+#    To find it: `kubectl -n openshift-ovn-kubernetes describe pod <ovn-pod-name>`
+#    and look under the 'Containers:' section.
+OVN_CONTAINER_NAME="ovnkube-node" 
+# ---------------------
+
+echo "Using $CLI to interact with the cluster."
+echo "Looking for OVN pods in namespace '$NAMESPACE' with selector '$LABEL_SELECTOR'."
+echo "Using container '$OVN_CONTAINER_NAME' within pods for ovn-nbctl commands."
+echo "---------------------------------------------------------"
+
+# Get list of "PodName NodeName"
+PODS_NODES=$($CLI -n "$NAMESPACE" get pods -l "$LABEL_SELECTOR" --field-selector=status.phase=Running -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.nodeName}{"\n"}{end}' || true)
+
+if [[ -z "$PODS_NODES" ]]; then
+    echo "Error: No running OVN controller pods found with label '$LABEL_SELECTOR' in namespace '$NAMESPACE'." >&2
+    echo "Please check the NAMESPACE and LABEL_SELECTOR variables in the script." >&2
+    exit 1
+fi
+
+TOTAL=$(echo "$PODS_NODES" | wc -l)
+CURRENT=0
+
+echo "Scanning $TOTAL nodes for Egress IPs (excluding node management IPs)..."
+printf "%-30s | %s\n" "NODE" "EGRESS IP(s)"
+echo "---------------------------------------------------------"
+
+# Iterate through every line of "Pod Node"
+while read -r pod k8s_node_name; do
+    CURRENT=$((CURRENT+1))
+    
+    # Print progress to stderr so it doesn't mess up the final table if redirected
+    echo -ne "Scanning [$CURRENT/$TOTAL]: $k8s_node_name ...\r" >&2
+
+    # --- NEW: Get the management IP for the current Kubernetes node ---
+    NODE_MANAGEMENT_IP=$($CLI get node "$k8s_node_name" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || true)
+    
+    # The router name standard in OVN-K is often GR_<kubernetes_node_name>
+    ROUTER_NAME="GR_${k8s_node_name}"
+
+    # Exec into the specific pod and container for that node
+    # We suppress stderr in case the router doesn't exist or other ovn-nbctl issues
+    RAW_NAT=$($CLI -n "$NAMESPACE" exec "$pod" -c "$OVN_CONTAINER_NAME" -- \
+        ovn-nbctl lr-nat-list "$ROUTER_NAME" 2>/dev/null || true)
+
+    # Parse the output looking for external_ip
+    # Then filter out the node's management IP
+    # Use word boundaries (\b) for exact IP matching to avoid partial matches
+    FILTERED_IPS=$(echo "$RAW_NAT" \
+        | grep -oP "external_ip:\K\S+" \
+        | grep -vP "\b$NODE_MANAGEMENT_IP\b" \
+        | sort -u \
+        | tr '\n' ' ' || true)
+
+    if [[ -z "$FILTERED_IPS" ]]; then
+        printf "%-30s | %s\n" "$k8s_node_name" "(none)"
+    else
+        printf "%-30s | %s\n" "$k8s_node_name" "$FILTERED_IPS"
+    fi
+
+done <<< "$PODS_NODES"
+
+echo -e "\nDone." >&2
