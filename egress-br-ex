@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+declare -A nodes
+
+while read -r ip host; do
+  # enlever /suffix de l'IP
+  ip="${ip%%/*}"
+  # garder seulement le nom commençant par satl (supprimer "node/" si présent)
+  host="${host##*/}"
+  # ajouter l'ip à la valeur de la clé host (séparateur espace)
+  if [[ -z "${nodes[$host]}" ]]; then
+    nodes[$host]="$ip"
+  else
+    nodes[$host]+=" $ip"
+  fi
+done < fichier.txt
+
+# Exemple: afficher toutes les clés et leurs IPs
+for k in "${!nodes[@]}"; do
+  echo "$k: ${nodes[$k]}"
+done
