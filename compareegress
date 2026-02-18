@@ -78,3 +78,82 @@ if [[ $has_errors -eq 0 ]]; then
 else
     echo "FAILURE: Discrepancies found."
 fi
+==============================================================================================================================================================================
+#!/usr/bin/env bash
+set -euo pipefail
+
+# 1. Initialize the associative arrays
+declare -A OVN_DISCOVERED_IPS
+declare -A nodes
+
+# ==========================================
+# INPUT DATA HERE
+# ==========================================
+
+# Example Data
+OVN_DISCOVERED_IPS["node1"]="10.0.0.1 10.0.0.2"
+OVN_DISCOVERED_IPS["node2"]="192.168.1.50"
+OVN_DISCOVERED_IPS["node3"]="172.16.0.1"      # Exists in both
+OVN_DISCOVERED_IPS["node_ovn_only"]="8.8.8.8" # Should be SKIPPED (not in 'nodes')
+
+nodes["node1"]="10.0.0.2 10.0.0.1"            # Match
+nodes["node2"]="192.168.1.99"                 # Mismatch
+nodes["node3"]="172.16.0.1"                   # Match
+nodes["node_nodes_only"]="1.1.1.1"            # Should be SKIPPED (not in 'OVN')
+
+# ==========================================
+# COMPARISON LOGIC
+# ==========================================
+
+echo "Starting comparison (Intersection only)..."
+echo "----------------------------------------"
+
+has_errors=0
+
+# Iterate only through keys defined in OVN_DISCOVERED_IPS
+for node in "${!OVN_DISCOVERED_IPS[@]}"; do
+    
+    # CHECK: Is this node also defined in the 'nodes' array?
+    # We use ${arr[key]+x} parameter expansion to safely check existence 
+    # without triggering 'unbound variable' errors if set -u is on.
+    if [[ -z "${nodes[$node]+x}" ]]; then
+        # Node is in OVN but not in 'nodes' -> SKIP
+        continue
+    fi
+
+    # If we are here, the node exists in BOTH arrays. Proceed.
+
+    # Normalize IPs: space to newline -> remove empty -> sort unique
+    list_ovn=$(echo "${OVN_DISCOVERED_IPS[$node]}" | tr ' ' '\n' | sed '/^$/d' | sort -u)
+    list_nodes=$(echo "${nodes[$node]}" | tr ' ' '\n' | sed '/^$/d' | sort -u)
+
+    if [[ "$list_ovn" == "$list_nodes" ]]; then
+        echo "[OK] Node: $node"
+    else
+        echo "[MISMATCH] Node: $node"
+        has_errors=1
+        
+        # Use 'comm' to calculate diffs based on sorted strings
+        only_in_ovn=$(comm -23 <(echo "$list_ovn") <(echo "$list_nodes"))
+        only_in_nodes=$(comm -13 <(echo "$list_ovn") <(echo "$list_nodes"))
+
+        if [[ -n "$only_in_ovn" ]]; then
+            formatted=$(echo "$only_in_ovn" | tr '\n' ' ')
+            echo "    -> Extra in OVN:   $formatted"
+        fi
+
+        if [[ -n "$only_in_nodes" ]]; then
+            formatted=$(echo "$only_in_nodes" | tr '\n' ' ')
+            echo "    -> Extra in nodes: $formatted"
+        fi
+        echo "" 
+    fi
+done
+
+echo "----------------------------------------"
+if [[ $has_errors -eq 0 ]]; then
+    echo "SUCCESS: All common nodes have matching IPs."
+else
+    echo "FAILURE: Discrepancies found in common nodes."
+fi
+
