@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+
+# 1. Initialize the associative arrays
+declare -A OVN_DISCOVERED_IPS
+declare -A nodes
+
+# ==========================================
+# INPUT DATA HERE
+# ==========================================
+
+# Example Data (Replace this with your actual data population logic)
+OVN_DISCOVERED_IPS["node1"]="10.0.0.1 10.0.0.2 10.0.0.3"
+OVN_DISCOVERED_IPS["node2"]="192.168.1.50"
+OVN_DISCOVERED_IPS["node3"]="172.16.0.1"
+
+nodes["node1"]="10.0.0.3 10.0.0.1 10.0.0.2"   # Same IPs, different order (Should Match)
+nodes["node2"]="192.168.1.50 192.168.1.51"    # Extra IP in 'nodes' (Should Mismatch)
+nodes["node3"]="172.16.0.2"                   # Different IP (Should Mismatch)
+
+# ==========================================
+# COMPARISON LOGIC
+# ==========================================
+
+echo "Starting comparison..."
+echo "----------------------"
+
+# 1. Get a unique list of all keys (node names) from both arrays
+# We combine keys from both arrays, replace spaces with newlines, and sort unique.
+all_node_names=$(echo "${!OVN_DISCOVERED_IPS[@]} ${!nodes[@]}" | tr ' ' '\n' | sort -u | sed '/^$/d')
+
+has_errors=0
+
+for node in $all_node_names; do
+    # 2. Extract and Normalize IPs for this node
+    # - Take the string value from the array (using :- to default to empty if missing)
+    # - Replace spaces with newlines (tr)
+    # - Remove empty lines (sed)
+    # - Sort and remove duplicates (sort -u)
+    
+    list_ovn=$(echo "${OVN_DISCOVERED_IPS[$node]:-}" | tr ' ' '\n' | sed '/^$/d' | sort -u)
+    list_nodes=$(echo "${nodes[$node]:-}" | tr ' ' '\n' | sed '/^$/d' | sort -u)
+
+    # 3. Compare the normalized strings
+    if [[ "$list_ovn" == "$list_nodes" ]]; then
+        echo "[OK] Node: $node"
+    else
+        echo "[MISMATCH] Node: $node"
+        has_errors=1
+        
+        # 4. Use 'comm' to find differences
+        # <(...) is process substitution, treating the variable output like a file
+        
+        # Show IPs present in OVN_DISCOVERED_IPS but MISSING in nodes
+        # comm -23: Suppress col 2 (unique to file 2) and col 3 (common) -> show only unique to file 1
+        only_in_ovn=$(comm -23 <(echo "$list_ovn") <(echo "$list_nodes"))
+        
+        # Show IPs present in nodes but MISSING in OVN_DISCOVERED_IPS
+        # comm -13: Suppress col 1 (unique to file 1) and col 3 (common) -> show only unique to file 2
+        only_in_nodes=$(comm -13 <(echo "$list_ovn") <(echo "$list_nodes"))
+
+        if [[ -n "$only_in_ovn" ]]; then
+            # Replace newlines with spaces for cleaner output
+            formatted=$(echo "$only_in_ovn" | tr '\n' ' ')
+            echo "    -> Extra in OVN_DISCOVERED_IPS: $formatted"
+        fi
+
+        if [[ -n "$only_in_nodes" ]]; then
+            formatted=$(echo "$only_in_nodes" | tr '\n' ' ')
+            echo "    -> Extra in nodes array:        $formatted"
+        fi
+        echo "" 
+    fi
+done
+
+echo "----------------------"
+if [[ $has_errors -eq 0 ]]; then
+    echo "SUCCESS: All nodes have matching IP configurations."
+else
+    echo "FAILURE: Discrepancies found."
+fi
