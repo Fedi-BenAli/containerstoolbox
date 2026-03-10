@@ -1,5 +1,14 @@
 egress_list=$(oc get egressips.network.openshift.io -o json 2>/dev/null | 
   jq -r '.items[] |
+    (.metadata.labels.cia // "") as $cia |
+    (.metadata.labels.role // "") as $role |
+    ((.spec.egressIPs) // (if (.spec.egressIP // null) then [ .spec.egressIP ] else [] end))[] |
+    "(.) ($cia) ($role)"' 2>/dev/null || true)
+
+
+
+egress_list=$(oc get egressips.network.openshift.io -o json 2>/dev/null | 
+  jq -r '.items[] |
      ((.spec.egressIPs // [.spec.egressIP])[] as $eip |
      "($eip) (.metadata.labels.cia // "") (.metadata.labels.role // "")")')
 
