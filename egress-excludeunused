@@ -78,3 +78,71 @@ fi
 # Join all collected IPs with a comma and print to stdout
 # If ALL_UNUSED_IPS is empty, this will print an empty line.
 IFS=, eval 'echo "${ALL_UNUSED_IPS[*]}"'
+
+
+
+***************************************************
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Check if an IP address was provided as an argument
+if [[ -z "$1" ]]; then
+    echo "Usage: $0 <IP_ADDRESS_TO_CHECK>" >&2
+    exit 1
+fi
+
+IP_TO_CHECK="$1"
+
+# Basic validation for IPv4 format
+if ! [[ "$IP_TO_CHECK" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+    echo "Error: '$IP_TO_CHECK' does not appear to be a valid IPv4 address format." >&2
+    exit 1
+fi
+
+# Define the path to your 'list_unused_egress_ips.sh' script
+# IMPORTANT: Adjust this path if your script is located elsewhere
+UNUSED_IPS_GENERATOR_SCRIPT="./list_unused_egress_ips.sh"
+
+# Check if the generator script exists and is executable
+if [[ ! -f "$UNUSED_IPS_GENERATOR_SCRIPT" ]]; then
+    echo "Error: Unused IP generator script not found at '$UNUSED_IPS_GENERATOR_SCRIPT'." >&2
+    echo "Please ensure the script exists and its path is correct." >&2
+    exit 1
+fi
+if [[ ! -x "$UNUSED_IPS_GENERATOR_SCRIPT" ]]; then
+    echo "Error: Unused IP generator script '$UNUSED_IPS_GENERATOR_SCRIPT' is not executable." >&2
+    echo "Please run 'chmod +x $UNUSED_IPS_GENERATOR_SCRIPT'." >&2
+    exit 1
+fi
+
+# Run the generator script to get the comma-separated list of unused IPs
+# Redirect stderr to /dev/null to suppress any internal error messages from the generator script
+UNUSED_IPS_LIST_STRING=$("$UNUSED_IPS_GENERATOR_SCRIPT" 2>/dev/null)
+
+# Convert the comma-separated string into a bash array
+# Handle case where UNUSED_IPS_LIST_STRING might be empty
+if [[ -n "$UNUSED_IPS_LIST_STRING" ]]; then
+    IFS=',' read -r -a UNUSED_IPS_ARRAY <<< "$UNUSED_IPS_LIST_STRING"
+else
+    # If the list is empty, the IP cannot be in it
+    echo "IP '$IP_TO_CHECK' is NOT in the list of unused EgressIPs."
+    exit 1
+fi
+
+# Check if the IP_TO_CHECK is present in the array
+found=false
+for ip in "${UNUSED_IPS_ARRAY[@]}"; do
+    if [[ "$ip" == "$IP_TO_CHECK" ]]; then
+        found=true
+        break
+    fi
+done
+
+if "$found"; then
+    echo "IP '$IP_TO_CHECK' IS in the list of unused EgressIPs."
+    exit 0
+else
+    echo "IP '$IP_TO_CHECK' is NOT in the list of unused EgressIPs."
+    exit 1
+fi
+
