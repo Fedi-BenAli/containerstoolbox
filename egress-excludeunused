@@ -1,0 +1,91 @@
+egress_list=$(oc get egressips.network.openshift.io -o json 2>/dev/null | 
+  jq -r '.items[] |
+     ((.spec.egressIPs // [.spec.egressIP])[] as $eip |
+     "($eip) (.metadata.labels.cia // "") (.metadata.labels.role // "")")')
+
+while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    eip=$(awk '{print $1}' <<<"$line")
+    cia=$(awk '{print $2}' <<<"$line")
+    role=$(awk '{print $3}' <<<"$line")
+
+
+if [[ -z "$cia" || -z "$role" ]]; then
+    continue
+fi
+
+ns_list=$(oc get ns -l "cia=${cia},role=${role}" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+
+total_pods=0
+if [[ -n "$ns_list" ]]; then
+    while IFS= read -r ns; do
+        [[ -z "$ns" ]] && continue
+        cnt=$(oc get pods -n "$ns" --no-headers 2>/dev/null | wc -l || true)
+        total_pods=$((total_pods + cnt))
+    done <<<"$ns_list"
+fi
+
+if [[ $total_pods -eq 0 ]]; then
+    IGNORE_EGRESS_IP["$eip"]=1
+fi
+done <<<"$egress_list"
+
+if [[ ${#IGNORE_EGRESS_IP[@]} -gt 0 ]]; then
+    echo "Ignoring Egress IPs with no pods in matching namespaces: ${!IGNORE_EGRESS_IP[@]}"
+fi
+
+
+filter_ips() {
+    local input_string="$1"
+    echo "$input_string" | tr ' ' '\n' | sed '/^$/d' | sort -u | while read -r ip; do
+        [[ -z "$ip" ]] && continue
+        if [[ -n "${IGNORE_EGRESS_IP[$ip]:-}" ]]; then
+            continue
+        fi
+        printf "%s\n" "$ip"
+    done
+}
+
+
+echo "Starting comparison (excluding unused Egress IPs)..."
+echo "-----------------------------------------------------------------"
+
+has_errors=0
+
+for node in "${!OVN_DISCOVERED_IPS[@]}"; do
+    if [[ -z "${nodes[$node]+x}" ]]; then
+        continue
+    fi
+
+
+
+list_ovn=$(filter_ips "${OVN_DISCOVERED_IPS[$node]}")
+list_nodes=$(filter_ips "${nodes[$node]}")
+
+if [[ "$list_ovn" == "$list_nodes" ]]; then
+    echo "[OK] Node: $node"
+else
+    echo "[MISMATCH] Node: $node"
+    has_errors=1
+
+    only_in_ovn=$(comm -23 <(echo "$list_ovn") <(echo "$list_nodes"))
+    only_in_nodes=$(comm -13 <(echo "$list_ovn") <(echo "$list_nodes"))
+
+    if [[ -n "$only_in_ovn" ]]; then
+        formatted=$(echo "$only_in_ovn" | tr '\n' ' ')
+        echo "    -> Extra in OVN:   $formatted"
+    fi
+    if [[ -n "$only_in_nodes" ]]; then
+        formatted=$(echo "$only_in_nodes" | tr '\n' ' ')
+        echo "    -> Extra in nodes: $formatted"
+    fi
+    echo ""
+fi
+done
+
+echo "-----------------------------------------------------------------"
+if [[ $has_errors -eq 0 ]]; then
+    echo "SUCCESS: All common nodes have matching IPs (after excluding unused Egress IPs)."
+else
+    echo "FAILURE: Discrepancies found in common nodes."
+fi
