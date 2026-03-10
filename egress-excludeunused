@@ -1,100 +1,149 @@
-egress_list=$(oc get egressips.network.openshift.io -o json 2>/dev/null | 
-  jq -r '.items[] |
-    (.metadata.labels.cia // "") as $cia |
-    (.metadata.labels.role // "") as $role |
-    ((.spec.egressIPs) // (if (.spec.egressIP // null) then [ .spec.egressIP ] else [] end))[] |
-    "(.) ($cia) ($role)"' 2>/dev/null || true)
+#!/usr/bin/env bash
+set -euo pipefail
 
+# Arrays to store results
+declare -a UNUSED_EGRESS_IPS
+declare -a ACTIVE_EGRESS_IPS
 
+echo "Starting EgressIP Audit..."
+echo "----------------------------------------------------"
 
-egress_list=$(oc get egressips.network.openshift.io -o json 2>/dev/null | 
-  jq -r '.items[] |
-     ((.spec.egressIPs // [.spec.egressIP])[] as $eip |
-     "($eip) (.metadata.labels.cia // "") (.metadata.labels.role // "")")')
+# 1. Get all EgressIP resources in JSON format
+# We need the name of the EgressIP and the list of namespaces it applies to.
+# Adjust the API group if necessary (usually k8s.ovn.org/v1)
+egress_resources=$(kubectl get egressips.k8s.ovn.org -o json)
 
-while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    eip=$(awk '{print $1}' <<<"$line")
-    cia=$(awk '{print $2}' <<<"$line")
-    role=$(awk '{print $3}' <<<"$line")
-
-
-if [[ -z "$cia" || -z "$role" ]]; then
-    continue
-fi
-
-ns_list=$(oc get ns -l "cia=${cia},role=${role}" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
-
-total_pods=0
-if [[ -n "$ns_list" ]]; then
-    while IFS= read -r ns; do
-        [[ -z "$ns" ]] && continue
-        cnt=$(oc get pods -n "$ns" --no-headers 2>/dev/null | wc -l || true)
-        total_pods=$((total_pods + cnt))
-    done <<<"$ns_list"
-fi
-
-if [[ $total_pods -eq 0 ]]; then
-    IGNORE_EGRESS_IP["$eip"]=1
-fi
-done <<<"$egress_list"
-
-if [[ ${#IGNORE_EGRESS_IP[@]} -gt 0 ]]; then
-    echo "Ignoring Egress IPs with no pods in matching namespaces: ${!IGNORE_EGRESS_IP[@]}"
-fi
-
-
-filter_ips() {
-    local input_string="$1"
-    echo "$input_string" | tr ' ' '\n' | sed '/^$/d' | sort -u | while read -r ip; do
-        [[ -z "$ip" ]] && continue
-        if [[ -n "${IGNORE_EGRESS_IP[$ip]:-}" ]]; then
-            continue
-        fi
-        printf "%s\n" "$ip"
-    done
-}
-
-
-echo "Starting comparison (excluding unused Egress IPs)..."
-echo "-----------------------------------------------------------------"
-
-has_errors=0
-
-for node in "${!OVN_DISCOVERED_IPS[@]}"; do
-    if [[ -z "${nodes[$node]+x}" ]]; then
+# 2. Iterate through each EgressIP resource
+# We use jq to output a stream of "EgressIPName Namespace1 Namespace2..."
+while read -r line; do
+    # Read the line into an array
+    # Index 0 is the EgressIP Name
+    # Index 1..N are the Namespaces
+    read -r -a parts <<< "$line"
+    
+    egress_ip_name="${parts[0]}"
+    
+    # If there are no namespaces assigned (length is 1), it's definitely unused
+    if [[ ${#parts[@]} -le 1 ]]; then
+        echo "[UNUSED] $egress_ip_name (No namespaces assigned)"
+        UNUSED_EGRESS_IPS+=("$egress_ip_name")
         continue
     fi
 
+    # Extract namespaces (slice array from index 1 to end)
+    namespaces=("${parts[@]:1}")
+    
+    echo "Checking EgressIP: $egress_ip_name"
+    echo "  -> Assigned Namespaces: ${namespaces[*]}"
 
+    has_active_pods=0
 
-list_ovn=$(filter_ips "${OVN_DISCOVERED_IPS[$node]}")
-list_nodes=$(filter_ips "${nodes[$node]}")
+    # 3. Check each assigned namespace for running pods
+    for ns in "${namespaces[@]}"; do
+        # Count pods in this namespace. 
+        # We assume 'Running' or 'ContainerCreating' indicates usage. 
+        # If you want ANY pod status (even Failed/Completed), remove the field-selector.
+        pod_count=$(kubectl get pods -n "$ns" --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l || echo 0)
+        
+        # Also check for Pending/ContainerCreating to be safe, or just check total count:
+        # pod_count=$(kubectl get pods -n "$ns" --no-headers 2>/dev/null | wc -l)
 
-if [[ "$list_ovn" == "$list_nodes" ]]; then
-    echo "[OK] Node: $node"
-else
-    echo "[MISMATCH] Node: $node"
-    has_errors=1
+        if [[ "$pod_count" -gt 0 ]]; then
+            echo "    -> Found $pod_count running pods in namespace '$ns'. (IN USE)"
+            has_active_pods=1
+            # Optimization: If we find one pod, the EgressIP is in use. We can stop checking other namespaces.
+            break 
+        else
+            echo "    -> Namespace '$ns' has 0 running pods."
+        fi
+    done
 
-    only_in_ovn=$(comm -23 <(echo "$list_ovn") <(echo "$list_nodes"))
-    only_in_nodes=$(comm -13 <(echo "$list_ovn") <(echo "$list_nodes"))
-
-    if [[ -n "$only_in_ovn" ]]; then
-        formatted=$(echo "$only_in_ovn" | tr '\n' ' ')
-        echo "    -> Extra in OVN:   $formatted"
+    # 4. Categorize result
+    if [[ $has_active_pods -eq 0 ]]; then
+        echo "  -> RESULT: UNUSED (No running pods in any assigned namespace)"
+        UNUSED_EGRESS_IPS+=("$egress_ip_name")
+    else
+        ACTIVE_EGRESS_IPS+=("$egress_ip_name")
     fi
-    if [[ -n "$only_in_nodes" ]]; then
-        formatted=$(echo "$only_in_nodes" | tr '\n' ' ')
-        echo "    -> Extra in nodes: $formatted"
+    echo "----------------------------------------------------"
+
+done < <(echo "$egress_resources" | jq -r '.items[] | "\(.metadata.name) " + (.spec.namespaceSelector.matchLabels | keys[]? // empty)')
+
+# Note on jq query above:
+# It assumes the standard OVN-Kubernetes EgressIP structure where namespaces are selected via matchLabels.
+# If your EgressIP uses specific namespace names directly, the jq query needs slight adjustment.
+# The query above extracts: "Name LabelKey" (It's actually harder to resolve selectors to names purely in jq without kubectl queries).
+
+# --- ALTERNATIVE PARSING STRATEGY (More Robust) ---
+# Since namespaceSelector matches LABELS, not names directly, we must resolve the selector.
+
+echo "Re-evaluating logic with precise Namespace Selector resolution..."
+# Reset arrays for the robust pass
+UNUSED_EGRESS_IPS=()
+
+# Get list of all EgressIP names
+egress_names=$(kubectl get egressips.k8s.ovn.org -o jsonpath='{.items[*].metadata.name}')
+
+for egress_name in $egress_names; do
+    echo "Inspecting: $egress_name"
+    
+    # Get the IPs (just for display/verification)
+    ips=$(kubectl get egressips.k8s.ovn.org "$egress_name" -o jsonpath='{.spec.egressIPs[*]}')
+    
+    # Get the Namespace Selector Labels
+    # Output format: key=value,key=value
+    selector_raw=$(kubectl get egressips.k8s.ovn.org "$egress_name" -o json | jq -r '.spec.namespaceSelector.matchLabels | to_entries | map("\(.key)=\(.value)") | join(",")')
+
+    if [[ -z "$selector_raw" || "$selector_raw" == "null" ]]; then
+        echo "  -> No Namespace selector found. Marked UNUSED."
+        UNUSED_EGRESS_IPS+=("$egress_name ($ips)")
+        continue
     fi
-    echo ""
-fi
+
+    echo "  -> IPs: $ips"
+    echo "  -> Selector: $selector_raw"
+
+    # Find namespaces that match this label selector
+    target_namespaces=$(kubectl get namespaces -l "$selector_raw" -o jsonpath='{.items[*].metadata.name}')
+
+    if [[ -z "$target_namespaces" ]]; then
+        echo "  -> Selector matches NO namespaces. Marked UNUSED."
+        UNUSED_EGRESS_IPS+=("$egress_name ($ips)")
+        continue
+    fi
+
+    pods_found=0
+    for ns in $target_namespaces; do
+        # Check for pods
+        count=$(kubectl get pods -n "$ns" --no-headers 2>/dev/null | wc -l)
+        if [[ $count -gt 0 ]]; then
+            echo "  -> Used by namespace '$ns' ($count pods)"
+            pods_found=1
+            break # Found usage, move to next EgressIP
+        fi
+    done
+
+    if [[ $pods_found -eq 0 ]]; then
+        echo "  -> No pods found in matching namespaces ($target_namespaces)."
+        UNUSED_EGRESS_IPS+=("$egress_name ($ips)")
+    fi
+    echo "---"
 done
 
-echo "-----------------------------------------------------------------"
-if [[ $has_errors -eq 0 ]]; then
-    echo "SUCCESS: All common nodes have matching IPs (after excluding unused Egress IPs)."
+# ==========================================
+# FINAL OUTPUT
+# ==========================================
+
+echo ""
+echo "=========================================="
+echo "SUMMARY: UNUSED EGRESS IP RESOURCES"
+echo "=========================================="
+
+if [[ ${#UNUSED_EGRESS_IPS[@]} -eq 0 ]]; then
+    echo "All EgressIPs are currently in use."
 else
-    echo "FAILURE: Discrepancies found in common nodes."
+    for item in "${UNUSED_EGRESS_IPS[@]}"; do
+        echo "- $item"
+    done
 fi
+echo "=========================================="
