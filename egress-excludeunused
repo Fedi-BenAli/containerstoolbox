@@ -1,5 +1,6 @@
-printf '%s\n' "${a[@]}" | sort > /tmp/A
-printf '%s\n' "${b[@]}" | sort > /tmp/B
-comm -3 /tmp/A /tmp/B   # lines present in only one file (shows differences)
-# cleanup
-rm /tmp/A /tmp/B
+if diff -q <(printf '%s\n' "${a[@]}" | sort -u) <(printf '%s\n' "${b[@]}" | sort -u) >/dev/null; then
+  echo "arrays have same items"
+else
+  echo "arrays differ"
+  printf 'Differences:\n%s\n' "$(printf '%s\n' "${a[@]}" "${b[@]}" | sort | uniq -u)"
+fi
