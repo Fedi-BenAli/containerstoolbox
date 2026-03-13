@@ -4,3 +4,16 @@ else
   echo "arrays differ"
   printf 'Differences:\n%s\n' "$(printf '%s\n' "${a[@]}" "${b[@]}" | sort | uniq -u)"
 fi
+------------------------------------------------------
+
+
+if [ "${#arr[@]}" -gt 0 ]; then
+  printf '%s\n' "${arr[@]}"
+fi
+If you want a single-line space-separated dump:
+
+------------------------------------------------------
+
+if [ "${#arr[@]}" -gt 0 ]; then
+  echo "${arr[*]}"
+fi
