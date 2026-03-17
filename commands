@@ -1,0 +1,1 @@
+kubectl get pod  -n  -o jsonpath='{.spec.containers[*].image}' | tr ' ' '\n' | awk -F: '{print $NF}'
