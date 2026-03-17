@@ -1,1 +1,4 @@
 kubectl get pod  -n  -o jsonpath='{.spec.containers[*].image}' | tr ' ' '\n' | awk -F: '{print $NF}'
+kubectl get deploy  -n  -o jsonpath='{.spec.template.spec.containers[*].image}' 
+| tr ' ' '\n' 
+| awk -F'[@:]' '{ if ($2=="sha256") print "<no-tag - digest>"; else if (NF>=2) print $NF; else print "latest?" }'
