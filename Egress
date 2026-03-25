@@ -1,8 +1,36 @@
-ver=$(oc get clusterversion version -o jsonpath='{.status.desired.version}' 2>/dev/null)
-if [[ $ver == 4.18* ]]; then
-  echo "Cluster is on 4.18 (desired: $ver)"
-  exit 0
+#!/bin/bash
+
+# 1. Get the OpenShift Server Version
+# We use 'oc version' and grep/awk to isolate the server version number.
+OC_VERSION=$(oc version -o json | jq -r '.openshiftVersion' 2>/dev/null)
+
+# Fallback method if jq is not installed, using grep/cut
+if [ -z "$OC_VERSION" ]; then
+    OC_VERSION=$(oc version 2>/dev/null | grep "Server Version" | awk '{print $3}')
+fi
+
+# Check if we successfully got a version
+if [ -z "$OC_VERSION" ]; then
+    echo "Error: Could not determine OpenShift version. Are you logged in?"
+    exit 1
+fi
+
+# 2. Check if version matches 4.18.*
+if [[ "$OC_VERSION" == 4.18.* ]]; then
+    echo "Cluster version is $OC_VERSION. Running test-cluster.sh..."
+
+    # 3. Run the script silently
+    # > /dev/null 2>&1 redirects both Standard Output and Standard Error to null
+    ./test-cluster.sh > /dev/null 2>&1
+    
+    # 4. Check the exit code of the previous command ($?)
+    if [ $? -eq 0 ]; then
+        echo "SUCCESS: test-cluster.sh exited correctly."
+    else
+        echo "FAILURE: test-cluster.sh encountered an error."
+        exit 1
+    fi
+
 else
-  echo "Cluster is NOT 4.18 (desired: ${ver:-unknown})" >&2
-  exit 1
+    echo "Skipping test. Cluster version is $OC_VERSION (Required: 4.18.*)."
 fi
