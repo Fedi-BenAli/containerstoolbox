@@ -1,0 +1,58 @@
+import re
+
+def process_worker_lists(initial_list):
+    """
+    Separates a list of worker strings into two *new* lists based on whether
+    the number they end with is even or odd.
+
+    Args:
+        initial_list (list): A list of strings, e.g., ['worker1', 'worker2', ...].
+
+    Returns:
+        tuple: A tuple containing:
+            - even_workers_sorted (list): Workers ending with even numbers, sorted.
+            - odd_workers_sorted (list): Workers ending with odd numbers, sorted.
+            - interleaved_list (list): The two sorted lists interleaved.
+    """
+    # These are your two NEW lists, distinct from the initial_list
+    list_of_even_ending_workers = [] # This will become your "first sublist"
+    list_of_odd_ending_workers = []  # This will become your "second sublist"
+
+    # Populate the two new lists based on the ending number
+    for item in initial_list:
+        match = re.search(r'\d+$', item)
+        if match:
+            number = int(match.group(0))
+            if number % 2 == 0:
+                list_of_even_ending_workers.append(item)
+            else:
+                list_of_odd_ending_workers.append(item)
+        else:
+            print(f"Warning: Could not extract number from '{item}'. Skipping.")
+
+    # 2. Sort the items in both new lists (using default sort for now)
+    even_workers_sorted = sorted(list_of_even_ending_workers)
+    odd_workers_sorted = sorted(list_of_odd_ending_workers)
+
+    # 3. Interleave the two sorted lists
+    interleaved_list = []
+    max_len = max(len(even_workers_sorted), len(odd_workers_sorted))
+
+    for i in range(max_len):
+        if i < len(even_workers_sorted):
+            interleaved_list.append(even_workers_sorted[i])
+        if i < len(odd_workers_sorted):
+            interleaved_list.append(odd_workers_sorted[i])
+            
+    return even_workers_sorted, odd_workers_sorted, interleaved_list
+
+# Example usage:
+my_workers = ['worker1', 'worker2', 'worker3', 'worker4', 'worker5', 'worker10', 'worker7', 'worker6']
+
+# Process the list
+even_sorted_result, odd_sorted_result, final_interleaved = process_worker_lists(my_workers)
+
+print(f"Original list (unchanged): {my_workers}")
+print(f"First new list (even ending, sorted): {even_sorted_result}")
+print(f"Second new list (odd ending, sorted): {odd_sorted_result}")
+print(f"Interleaved list: {final_interleaved}")
