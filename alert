@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Namespace where everything will run
+NS="cluster-checks"
+
+echo "Enabling user-workload monitoring (if not already enabled)..."
+cat <<'EOF' | oc apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: user-workload-monitoring-config
+  namespace: openshift-monitoring
+data:
+  config.yaml: |
+    prometheus:
+      enabled: true
+    thanosRuler:
+      enabled: true
+EOF
+
+echo "Creating namespace ${NS}..."
+oc new-project "${NS}" >/dev/null 2>&1 || echo "Namespace ${NS} already exists"
+
+echo "Deploying Pushgateway..."
+cat <<EOF | oc apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pushgateway
+  namespace: ${NS}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pushgateway
+  template:
+    metadata:
+      labels:
+        app: pushgateway
+    spec:
+      containers:
+        - name: pushgateway
+          image: prom/pushgateway:v1.9.0
+          ports:
+            - containerPort: 9091
+              name: http
+          args:
+            - --web.listen-address=:9091
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pushgateway
+  namespace: ${NS}
+  labels:
+    app: pushgateway
+spec:
+  selector:
+    app: pushgateway
+  ports:
+    - name: http
+      port: 9091
+      targetPort: http
+EOF
+
+echo "Creating ServiceMonitor for Pushgateway..."
+cat <<EOF | oc apply -f -
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: pushgateway
+  namespace: ${NS}
+  labels:
+    team: cluster-checks
+spec:
+  selector:
+    matchLabels:
+      app: pushgateway
+  namespaceSelector:
+    matchNames:
+      - ${NS}
+  endpoints:
+    - port: http
+      interval: 30s
+EOF
+
+echo "Creating ServiceAccount and RBAC for cluster checks..."
+cat <<EOF | oc apply -f -
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cluster-checks-sa
+  namespace: ${NS}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cluster-checks-role
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "pods", "namespaces"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cluster-checks-crb
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-checks-role
+subjects:
+  - kind: ServiceAccount
+    name: cluster-checks-sa
+    namespace: ${NS}
+EOF
+
+echo "Creating cluster check script ConfigMap..."
+cat <<'EOF' | oc apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-checks-script
+  namespace: cluster-checks
+data:
+  cluster-checks.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    # Adjust this URL if you change namespace/name/port of Pushgateway
+    PUSHGATEWAY_URL="http://pushgateway.cluster-checks.svc:9091"
+    JOB_NAME="openshift_cluster_checks"
+    CHECK_NAME="overall_cluster_health"
+
+    issue_detected=0
+    issue_message="OK"
+
+    # ---------------------------
+    # PLACE YOUR CHECKS HERE
+    # Example: fail if any node is NotReady
+    # ---------------------------
+
+    if oc get nodes | grep -q 'NotReady'; then
+      issue_detected=1
+      issue_message="Found NotReady nodes"
+    fi
+
+    # You can add more checks and combine into a single status if you like
+    # Example of multiple checks (uncomment and adjust):
+    # issue_detected_node=0
+    # msg_node="OK"
+    # if oc get nodes | grep -q 'NotReady'; then
+    #   issue_detected_node=1
+    #   msg_node="NotReady nodes"
+    # fi
+    #
+    # issue_detected_api=0
+    # msg_api="OK"
+    # if ! oc whoami > /dev/null 2>&1; then
+    #   issue_detected_api=1
+    #   msg_api="API not responsive"
+    # fi
+    #
+    # # Overall issue if any sub-check failed
+    # if [[ $issue_detected_node -eq 1 || $issue_detected_api -eq 1 ]]; then
+    #   issue_detected=1
+    #   issue_message="node=${msg_node}, api=${msg_api}"
+    # fi
+
+    metrics=$(cat <<METRICS
+    # HELP cluster_check_status Status of custom OpenShift cluster check (0=OK,1=problem)
+    # TYPE cluster_check_status gauge
+    cluster_check_status{check_name="${CHECK_NAME}",message="${issue_message}"} ${issue_detected}
+    METRICS
+    )
+
+    curl -s --data-binary "${metrics}" \
+      "${PUSHGATEWAY_URL}/metrics/job/${JOB_NAME}/instance/cluster-check-script" \
+      > /dev/null
+EOF
+
+echo "Creating CronJob to run the checks..."
+cat <<EOF | oc apply -f -
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cluster-checks
+  namespace: ${NS}
+spec:
+  schedule: "*/5 * * * *"  # run every 5 minutes
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: cluster-checks-sa
+          restartPolicy: OnFailure
+          containers:
+            - name: cluster-checks
+              image: registry.access.redhat.com/openshift4/ose-cli:latest
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  chmod +x /scripts/cluster-checks.sh
+                  /scripts/cluster-checks.sh
+              volumeMounts:
+                - name: scripts
+                  mountPath: /scripts
+          volumes:
+            - name: scripts
+              configMap:
+                name: cluster-checks-script
+                defaultMode: 0755
+EOF
+
+echo "Creating PrometheusRule alert..."
+cat <<EOF | oc apply -f -
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cluster-checks-alerts
+  namespace: ${NS}
+  labels:
+    prometheus: user-workload
+    role: alert-rules
+spec:
+  groups:
+    - name: cluster-checks.rules
+      rules:
+        - alert: CustomClusterCheckFailed
+          expr: cluster_check_status == 1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Custom cluster check failed"
+            description: "Custom check '{{ \$labels.check_name }}' detected a problem: {{ \$labels.message }}"
+EOF
+
+echo
+echo "Done."
+echo "Next steps:"
+echo " 1) Edit the script in ConfigMap 'cluster-checks-script' to match your checks:"
+echo "      oc -n ${NS} edit configmap cluster-checks-script"
+echo " 2) Wait for CronJob to run, then in the console go to Monitoring -> Metrics"
+echo "    and query: cluster_check_status"
+echo " 3) After a failure (value=1 for 10m), check Monitoring -> Alerts for 'CustomClusterCheckFailed'."
