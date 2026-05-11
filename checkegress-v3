@@ -1,0 +1,102 @@
+#!/bin/bash
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Function to log messages
+log() {
+    echo -e "${GREEN}[$(date '+%Y-%m-%d %H:%M:%S')]${NC} $1"
+}
+
+warn() {
+    echo -e "${YELLOW}[$(date '+%Y-%m-%d %H:%M:%S')] WARNING:${NC} $1"
+}
+
+error() {
+    echo -e "${RED}[$(date '+%Y-%m-%d %H:%M:%S')] ERROR:${NC} $1"
+}
+
+# Function to check if namespace should be skipped
+should_skip_namespace() {
+    local namespace=$1
+    local skip_patterns=(
+        "openshift-"
+        "kube-"
+        "istio-"
+        "knative-"
+        "tekton-"
+        "default"
+        "kubernetes-dashboard"
+    )
+    
+    for pattern in "${skip_patterns[@]}"; do
+        if [[ $namespace == $pattern* ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Function to get EgressIP for a namespace
+get_namespace_egressip() {
+    local namespace=$1
+    oc get netnamespace "$namespace" -o jsonpath='{.egressIPs}' 2>/dev/null
+}
+
+# Function to get running pod from namespace
+get_running_pod() {
+    local namespace=$1
+    oc get pods -n "$namespace" --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null
+}
+
+# Function to get pod's node
+get_pod_node() {
+    local namespace=$1
+    local pod=$2
+    oc get pod "$pod" -n "$namespace" -o jsonpath='{.spec.nodeName}' 2>/dev/null
+}
+
+# Function to get pod's IP
+get_pod_ip() {
+    local namespace=$1
+    local pod=$2
+    oc get pod "$pod" -n "$namespace" -o jsonpath='{.status.podIP}' 2>/dev/null
+}
+
+# Function to check NAT rules on OVN
+check_ovn_nat_rules() {
+    local pod_ip=$1
+    local egress_ips=$2
+    local node=$3
+    
+    log "Checking NAT rules for pod IP: $pod_ip on node: $node"
+    log "Expected EgressIPs: $egress_ips"
+    
+    # Get the OVN router
+    local router=$(oc exec -n openshift-ovn-kubernetes ovnkube-master-0 -c ovnkube-master -- \
+        ovn-nbctl show | grep -E "router.*ovn_cluster_router" | head -1 | awk '{print $2}')
+    
+    if [[ -z "$router" ]]; then
+        error "Could not find OVN cluster router"
+        return 1
+    fi
+    
+    # Check NAT rules for this pod IP
+    local nat_rules=$(oc exec -n openshift-ovn-kubernetes ovnkube-master-0 -c ovnkube-master -- \
+        ovn-nbctl list NAT | grep -A 5 -B 5 "$pod_ip" 2>/dev/null)
+    
+    if [[ -z "$nat_rules" ]]; then
+        warn "No NAT rules found for pod IP: $pod_ip"
+        return 1
+    fi
+    
+    echo "Found NAT rules:"
+    echo "$nat_rules"
+    
+    # Count NAT rules for this pod IP
+    local rule_count=$(echo "$nat_rules" | grep -c "external_ip.*$pod_ip\|logical_ip.*$pod_ip" || true)
+    
+    # Parse Egress
