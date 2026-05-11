@@ -89,14 +89,4 @@ check_ovn_nat_rules() {
         ovn-nbctl list NAT | grep -A 5 -B 5 "$pod_ip" 2>/dev/null)
     
     if [[ -z "$nat_rules" ]]; then
-        warn "No NAT rules found for pod IP: $pod_ip"
-        return 1
-    fi
-    
-    echo "Found NAT rules:"
-    echo "$nat_rules"
-    
-    # Count NAT rules for this pod IP
-    local rule_count=$(echo "$nat_rules" | grep -c "external_ip.*$pod_ip\|logical_ip.*$pod_ip" || true)
-    
-    # Parse Egress
+        warn 
