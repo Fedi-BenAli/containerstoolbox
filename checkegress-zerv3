@@ -1,53 +1,207 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# check-egressip-nat-rules.sh
+# Verifies that each application namespace has exactly 2 OVN NAT (SNAT) rules
+# configured for EgressIP (one per physical IP).
+#
+# Requirements:
+#   - oc CLI logged in with cluster-admin
+#   - Must run on an OVN-Kubernetes cluster (OpenShift 4.x with OVN)
+#   - ovn-nbctl is called via 'oc exec' into the ovnkube-master pod
 
-# Get one of the ovnkube-master pods to run ovn-nbctl commands
-OVN_MASTER=$(oc get pods -n openshift-ovn-kubernetes -l app=ovnkube-master -o name | head -n 1)
+set -euo pipefail
 
-if [ -z "$OVN_MASTER" ]; then
-    echo "Error: Could not find ovnkube-master pod."
-    exit 1
+# ── Colours ──────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+
+# ── Config ────────────────────────────────────────────────────────────────────
+EXPECTED_NAT_COUNT=2          # Number of physical IPs per EgressIP object
+OVN_NAMESPACE="openshift-ovn-kubernetes"
+OVN_MASTER_LABEL="app=ovnkube-master"
+
+# Namespaces to skip (OpenShift system namespaces)
+SKIP_PATTERN='^(openshift|kube|default$|open-cluster|multicluster|hive|assisted|local-path)'
+
+# ── Counters ──────────────────────────────────────────────────────────────────
+PASS=0; FAIL=0; SKIP=0; WARN=0
+
+# ── Helper: print section header ──────────────────────────────────────────────
+header() { echo -e "\n${BOLD}${CYAN}══ $* ══${NC}"; }
+
+# ── Resolve the ovnkube-master pod (north db lives here) ──────────────────────
+resolve_ovn_master() {
+  oc get pods -n "$OVN_NAMESPACE" -l "$OVN_MASTER_LABEL" \
+     --field-selector=status.phase=Running \
+     -o jsonpath='{.items[0].metadata.name}' 2>/dev/null
+}
+
+# ── Run ovn-nbctl inside the master pod ───────────────────────────────────────
+nbctl() {
+  oc exec -n "$OVN_NAMESPACE" "$OVN_MASTER_POD" \
+     -c northd -- ovn-nbctl --no-leader-only "$@" 2>/dev/null
+}
+
+# ── Get the OVN logical switch port name for a pod ───────────────────────────
+# Convention: <namespace>_<podname> — verify it exists in the NB DB
+pod_logical_port() {
+  local ns=$1 pod=$2
+  local port="${ns}_${pod}"
+  # Confirm the LSP exists; return empty string if not found
+  if nbctl lsp-get-addresses "$port" &>/dev/null; then
+    echo "$port"
+  else
+    echo ""
+  fi
+}
+
+# ── Count SNAT rules whose logical_ip matches the pod's IP ───────────────────
+count_nat_rules_for_pod() {
+  local pod_ip=$1
+  # List all NAT entries of type snat, filter by logical_ip == pod_ip
+  nbctl --format=csv --columns=type,logical_ip,external_ip find NAT type=snat \
+    | awk -F',' -v ip="$pod_ip" '$2 == ip {count++} END {print count+0}'
+}
+
+# ── Count SNAT rules whose logical_ip matches the pod subnet (namespace-level) ─
+count_nat_rules_for_namespace() {
+  local ns=$1
+  # EgressIP SNATs are often keyed on the pod subnet assigned to the namespace.
+  # We look for entries whose external_ids contain the namespace.
+  nbctl --format=csv --columns=type,external_ids,external_ip find NAT type=snat \
+    | grep -c "\"k8s.ovn.org/egressip-namespace\"=\"${ns}\"" || true
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+header "Initialising"
+
+OVN_MASTER_POD=$(resolve_ovn_master)
+if [[ -z "$OVN_MASTER_POD" ]]; then
+  echo -e "${RED}ERROR: Could not find a running ovnkube-master pod in ${OVN_NAMESPACE}${NC}"
+  exit 1
 fi
+echo -e "OVN master pod : ${BOLD}${OVN_MASTER_POD}${NC}"
 
-echo "Using OVN Master Pod: $OVN_MASTER"
-echo "--------------------------------------------------------"
+# ── Gather all namespaces that have an EgressIP assigned ─────────────────────
+header "Discovering EgressIP assignments"
 
-# Get all namespaces excluding OpenShift/Kube system namespaces
-NAMESPACES=$(oc get namespaces -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep -vE "openshift|kube-|default|node-tracking")
+declare -A NS_EGRESSIPS   # ns -> "ip1 ip2 ..."
+while IFS= read -r line; do
+  ns=$(echo "$line" | awk '{print $1}')
+  egress_ips=$(echo "$line" | awk '{$1=""; print $0}' | xargs)
+  NS_EGRESSIPS["$ns"]="$egress_ips"
+done < <(
+  oc get egressip -A -o json \
+  | jq -r '
+      .items[] |
+      .spec.egressIPs[] as $ip |
+      .spec.namespaceSelector |
+      . as $sel |
+      $ip
+    ' 2>/dev/null || true
 
-for NS in $NAMESPACES; do
-    # Check if there is at least one running pod in the namespace
-    RUNNING_POD=$(oc get pods -n "$NS" --field-selector=status.phase=Running -o name | head -n 1)
-    
-    if [ -z "$RUNNING_POD" ]; then
-        continue
-    fi
+  # More reliable: iterate EgressIP objects
+  oc get egressip -o json \
+  | jq -r '
+      .items[] as $obj |
+      ($obj.spec.egressIPs // []) as $ips |
+      ($obj.status.items // []) as $assigned |
+      $assigned[] |
+      .namespace + " " + ($ips | join(" "))
+    ' 2>/dev/null
+)
 
-    # Find EgressIP objects that target this namespace
-    # This checks if the namespace name is explicitly listed in the EgressIP spec
-    EGRESS_DATA=$(oc get egressip -o json | jq -c --arg ns "$NS" '.items[] | select(.spec.namespaces[] == $ns)')
+# ── Main loop over application namespaces ────────────────────────────────────
+header "Checking namespaces"
 
-    if [ -z "$EGRESS_DATA" ]; then
-        # If not found by name, it might be targeted by labels (common in larger setups)
-        # For simplicity, this script focuses on direct namespace matching.
-        continue
-    fi
+ALL_NS=$(oc get namespaces -o jsonpath='{.items[*].metadata.name}')
 
-    EIP_NAME=$(echo "$EGRESS_DATA" | jq -r '.metadata.name')
-    EXPECTED_IPS=$(echo "$EGRESS_DATA" | jq -r '.spec.egressIPs[]')
-    
-    echo "Namespace: $NS (Pod: ${RUNNING_POD#pod/})"
-    echo "  EgressIP Object: $EIP_NAME"
+for NS in $ALL_NS; do
 
-    for IP in $EXPECTED_IPS; do
-        # Query OVN Northbound DB for the NAT rule
-        # We look for snat rules where the external_ip matches our EgressIP
-        NAT_CHECK=$(oc exec -n openshift-ovn-kubernetes "$OVN_MASTER" -c ovnkube-master -- ovn-nbctl find nat external_ip="$IP" | grep "external_ip")
+  # ── Skip system namespaces ──────────────────────────────────────────────
+  if echo "$NS" | grep -qE "$SKIP_PATTERN"; then
+    ((SKIP++)) || true
+    continue
+  fi
 
-        if [ -n "$NAT_CHECK" ]; then
-            echo "  [OK] NAT Rule exists for Physical IP: $IP"
-        else
-            echo "  [FAIL] Missing NAT Rule for Physical IP: $IP"
-        fi
-    done
-    echo "--------------------------------------------------------"
+  # ── Check if namespace has EgressIP label/annotation ───────────────────
+  HAS_EGRESSIP=$(oc get namespace "$NS" \
+    -o jsonpath='{.metadata.labels.k8s\.ovn\.org/egress-assignable}' 2>/dev/null || true)
+
+  # Also check if any EgressIP object targets this namespace
+  TARGETED=$(oc get egressip -o json 2>/dev/null \
+    | jq -r --arg ns "$NS" '
+        .items[] |
+        select(
+          (.status.items // [])[] | .namespace == $ns
+        ) | .metadata.name
+      ' | head -1)
+
+  if [[ -z "$TARGETED" ]]; then
+    echo -e "  ${YELLOW}SKIP${NC}  ${NS} — no EgressIP targets this namespace"
+    ((SKIP++)) || true
+    continue
+  fi
+
+  echo -e "\n  ${BOLD}Namespace: ${NS}${NC}  (EgressIP object: ${TARGETED})"
+
+  # ── Pick one running pod ────────────────────────────────────────────────
+  POD=$(oc get pods -n "$NS" \
+        --field-selector=status.phase=Running \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+
+  if [[ -z "$POD" ]]; then
+    echo -e "    ${YELLOW}WARN${NC}  No running pod found — skipping namespace"
+    ((WARN++)) || true
+    continue
+  fi
+
+  POD_IP=$(oc get pod "$POD" -n "$NS" \
+           -o jsonpath='{.status.podIP}' 2>/dev/null || true)
+
+  echo -e "    Pod     : ${POD}  (${POD_IP})"
+
+  if [[ -z "$POD_IP" ]]; then
+    echo -e "    ${YELLOW}WARN${NC}  Could not resolve pod IP"
+    ((WARN++)) || true
+    continue
+  fi
+
+  # ── Count OVN SNAT rules ────────────────────────────────────────────────
+  # Strategy 1: match by pod IP (most precise)
+  NAT_COUNT=$(count_nat_rules_for_pod "$POD_IP")
+
+  # Strategy 2: fallback — match by namespace label in external_ids
+  if [[ "$NAT_COUNT" -eq 0 ]]; then
+    NAT_COUNT=$(count_nat_rules_for_namespace "$NS")
+    [[ "$NAT_COUNT" -gt 0 ]] && echo -e "    (matched via namespace external_ids)"
+  fi
+
+  echo -e "    NAT rules found: ${BOLD}${NAT_COUNT}${NC} (expected: ${EXPECTED_NAT_COUNT})"
+
+  # ── Show the actual rules for context ──────────────────────────────────
+  echo -e "    Rules detail:"
+  nbctl --format=table --columns=type,logical_ip,external_ip,external_ids \
+        find NAT type=snat \
+    | grep -E "(${POD_IP}|${NS})" \
+    | sed 's/^/      /' || echo "      (none matched)"
+
+  # ── Pass / Fail ─────────────────────────────────────────────────────────
+  if [[ "$NAT_COUNT" -eq "$EXPECTED_NAT_COUNT" ]]; then
+    echo -e "    ${GREEN}PASS${NC}  ✔  ${NAT_COUNT}/${EXPECTED_NAT_COUNT} NAT rules present"
+    ((PASS++)) || true
+  else
+    echo -e "    ${RED}FAIL${NC}  ✘  ${NAT_COUNT}/${EXPECTED_NAT_COUNT} NAT rules present"
+    ((FAIL++)) || true
+  fi
+
 done
+
+# ═════════════════════════════════════════════════════════════════════════════
+header "Summary"
+echo -e "  ${GREEN}PASS${NC}  : ${PASS}"
+echo -e "  ${RED}FAIL${NC}  : ${FAIL}"
+echo -e "  ${YELLOW}WARN${NC}  : ${WARN}"
+echo -e "  SKIP  : ${SKIP}"
+echo ""
+
+[[ "$FAIL" -eq 0 ]] && exit 0 || exit 1
