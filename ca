@@ -19,6 +19,11 @@ basicConstraints = critical,CA:TRUE
 keyUsage = critical,keyCertSign,cRLSign
 subjectKeyIdentifier = hash
 authorityKeyIdentifier = keyid:always,issuer:always
+
+[name_constraints]
+permitted;DNS.1 = kubo.rie.gouv.fr
+permitted;DNS.2 = .kubo.rie.gouv.fr
+EOF
 EOF
 
 
