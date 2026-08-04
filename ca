@@ -1,0 +1,80 @@
+openssl genrsa -out root-ca-key.pem 4096
+
+  cat > root-ca.conf << EOF
+[req]
+distinguished_name = req_distinguished_name
+x509_extensions = v3_ca
+prompt = no
+
+[req_distinguished_name]
+C = US
+ST = State
+L = City
+O = Organization
+OU = IT Department
+CN = kubo.rie.go.ff Root CA
+
+[v3_ca]
+basicConstraints = critical,CA:TRUE
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always,issuer:always
+EOF
+
+
+openssl req -new -x509 -key root-ca-key.pem -sha256 -days 3650 -out root-ca-cert.pem -config root-ca.conf
+cat > intermediate-ca.conf << EOF
+[req]
+distinguished_name = req_distinguished_name
+req_extensions = v3_intermediate_ca
+prompt = no
+
+[req_distinguished_name]
+C = US
+ST = State
+L = City
+O = Organization
+OU = IT Department
+CN = dev.dg01.kubo.rie.go.ff Intermediate CA
+
+[v3_intermediate_ca]
+basicConstraints = critical,CA:TRUE,pathlen:0
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always,issuer:always
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = *.dev.dg01.kubo.rie.go.ff
+DNS.2 = dev.dg01.kubo.rie.go.ff
+EOF
+
+
+
+openssl req -new -key intermediate-ca-key.pem -out intermediate-ca-csr.pem -config intermediate-ca.conf
+
+
+  cat > intermediate-signing.conf << EOF
+[v3_intermediate_ca]
+basicConstraints = critical,CA:TRUE,pathlen:0
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always,issuer:always
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = *.dev.dg01.kubo.rie.go.ff
+DNS.2 = dev.dg01.kubo.rie.go.ff
+EOF
+
+
+
+openssl x509 -req -in intermediate-ca-csr.pem -CA root-ca-cert.pem -CAkey root-ca-key.pem -CAcreateserial -out intermediate-ca-cert.pem -days 1825 -sha256 -extensions v3_intermediate_ca -extfile intermediate-signing.conf
+
+
+
+  openssl x509 -in root-ca-cert.pem -text -noout
+
+  openssl x509 -in intermediate-ca-cert.pem -text -noout
+
+  openssl verify -CAfile root-ca-cert.pem intermediate-ca-cert.pem
