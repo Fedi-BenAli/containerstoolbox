@@ -98,3 +98,142 @@ openssl x509 -req -in intermediate-ca-csr.pem -CA root-ca-cert.pem -CAkey root-c
   openssl x509 -in intermediate-ca-cert.pem -text -noout
 
   openssl verify -CAfile root-ca-cert.pem intermediate-ca-cert.pem
+------------------------------------------------------
+
+Configuration complète pour l'Intermediate CA
+1. Créer la clé privée de l'Intermediate CA :
+bash
+
+Collapse
+
+
+ Copy
+
+openssl genrsa -out intermediate-ca-key.pem 4096
+2. Créer le fichier de configuration pour la CSR (intermediate-ca-csr.conf) :
+bash
+
+Collapse
+
+
+ Copy
+
+cat > intermediate-ca-csr.conf << EOF
+[req]
+distinguished_name = req_distinguished_name
+req_extensions = v3_req
+prompt = no
+
+[req_distinguished_name]
+C = FR
+ST = France
+L = Paris
+O = Gouvernement
+OU = IT Department - Dev Division
+CN = dev.dg01.kubo.rie.go.ff Intermediate CA
+
+[v3_req]
+basicConstraints = CA:TRUE
+keyUsage = keyCertSign, cRLSign
+EOF
+3. Créer la Certificate Signing Request (CSR) :
+bash
+
+Collapse
+
+
+ Copy
+
+openssl req -new -key intermediate-ca-key.pem -out intermediate-ca.csr -config intermediate-ca-csr.conf
+4. Créer le fichier de configuration pour la signature (intermediate-ca-signing.conf) :
+bash
+
+Collapse
+
+
+ Copy
+
+cat > intermediate-ca-signing.conf << EOF
+[v3_intermediate_ca]
+basicConstraints = critical,CA:TRUE,pathlen:0
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always,issuer:always
+nameConstraints = critical,@name_constraints
+crlDistributionPoints = @crl_section
+authorityInfoAccess = @ocsp_section
+
+[name_constraints]
+permitted;DNS.1 = dev.dg01.kubo.rie.go.ff
+permitted;DNS.2 = .dev.dg01.kubo.rie.go.ff
+
+[crl_section]
+URI.1 = http://crl.kubo.rie.go.ff/intermediate.crl
+
+[ocsp_section]
+caIssuers;URI.1 = http://certs.kubo.rie.go.ff/intermediate.crt
+OCSP;URI.1 = http://ocsp.kubo.rie.go.ff
+EOF
+5. Signer l'Intermediate CA avec la Root CA :
+bash
+
+Collapse
+
+
+ Copy
+
+openssl x509 -req -in intermediate-ca.csr \
+    -CA root-ca-cert.pem \
+    -CAkey root-ca-key.pem \
+    -CAcreateserial \
+    -out intermediate-ca-cert.pem \
+    -days 1825 \
+    -sha256 \
+    -extensions v3_intermediate_ca \
+    -extfile intermediate-ca-signing.conf
+6. Créer la chaîne de certificats complète :
+bash
+
+Collapse
+
+
+ Copy
+
+cat intermediate-ca-cert.pem root-ca-cert.pem > ca-chain.pem
+7. Créer le fichier de configuration pour les certificats finaux (server-cert.conf) :
+bash
+
+Collapse
+
+
+ Copy
+
+cat > server-cert.conf << EOF
+[req]
+distinguished_name = req_distinguished_name
+req_extensions = v3_req
+prompt = no
+
+[req_distinguished_name]
+C = FR
+ST = France
+L = Paris
+O = Gouvernement
+OU = IT Department - Dev Division
+
+[v3_req]
+basicConstraints = CA:FALSE
+keyUsage = nonRepudiation, digitalSignature, keyEncipherment
+subjectAltName = @alt_names
+
+[server_cert]
+basicConstraints = CA:FALSE
+nsCertType = server
+nsComment = "OpenSSL Generated Server Certificate"
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer:always
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = @alt_names
+crlDistributionPoints = @crl_section
+authorityInfoAccess = @ocsp_section
