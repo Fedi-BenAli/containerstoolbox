@@ -75,6 +75,20 @@ EOF
 
 
 
+cat > intermediate-signing-restricted.conf << EOF
+[v3_intermediate_ca]
+basicConstraints = critical,CA:TRUE,pathlen:0
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always,issuer:always
+nameConstraints = critical,@name_constraints
+
+[name_constraints]
+permitted;DNS.1 = dev.dg01.kubo.rie.go.ff
+permitted;DNS.2 = .dev.dg01.kubo.rie.go.ff
+EOF
+
+
 openssl x509 -req -in intermediate-ca-csr.pem -CA root-ca-cert.pem -CAkey root-ca-key.pem -CAcreateserial -out intermediate-ca-cert.pem -days 1825 -sha256 -extensions v3_intermediate_ca -extfile intermediate-signing.conf
 
 
