@@ -8,3 +8,33 @@ bao write auth/kubernetes/config \
   kubernetes_host="$KUBE_HOST" \
   kubernetes_ca_cert="$KUBE_CACERT" \
   token_reviewer_jwt="$KUBE_TOKEN"
+-----------------
+
+
+
+
+# Créer un namespace pour OpenBao (si ce n'est pas déjà fait)
+kubectl create namespace openbao
+
+# Créer le service account
+kubectl create serviceaccount openbao -n openbao
+
+# Créer un ClusterRoleBinding pour les permissions nécessaires
+kubectl create clusterrolebinding openbao-tokenreview \
+  --clusterrole=system:auth-delegator \
+  --serviceaccount=openbao:openbao
+Étape 2: Récupérer les credentials
+
+# Obtenir le token du service account
+KUBE_TOKEN=$(kubectl get secret $(kubectl get secret -n openbao -o jsonpath='{.items[?(@.type=="kubernetes.io/service-account-token")].metadata.name}' | head -n1) -n openbao -o jsonpath='{.data.token}' | base64 --decode)
+
+# Obtenir le certificat CA
+KUBE_CACERT=$(kubectl get secret $(kubectl get secret -n openbao -o jsonpath='{.items[?(@.type=="kubernetes.io/service-account-token")].metadata.name}' | head -n1) -n openbao -o jsonpath='{.data.ca\.crt}' | base64 --decode)
+
+# Obtenir l'host du cluster
+KUBE_HOST="https://$(kubectl config view --raw --minify --flatten -o jsonpath='{.clusters[0].cluster.server}' | cut -d'/' -f3)"
+
+# Vérifier les valeurs
+echo "HOST: $KUBE_HOST"
+echo "TOKEN: $KUBE_TOKEN"
+echo "CACERT: $KUBE_CACERT"
