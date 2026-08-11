@@ -38,3 +38,50 @@ KUBE_HOST="https://$(kubectl config view --raw --minify --flatten -o jsonpath='{
 echo "HOST: $KUBE_HOST"
 echo "TOKEN: $KUBE_TOKEN"
 echo "CACERT: $KUBE_CACERT"
+
+
+
+
+
+
+
+
+--------------------
+
+bao policy write pki-issuer - <<EOF
+path "pki/issue/kubernetes" {
+  capabilities = ["create", "update"]
+}
+
+path "pki/certs" {
+  capabilities = ["list"]
+}
+EOF
+
+
+bao write auth/kubernetes/role/pki-issuer \
+  bound_service_account_names=cert-issuer \
+  bound_service_account_namespaces=default \
+  policies=pki-issuer \
+  ttl=24h
+
+
+
+
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: openbao-issuer
+spec:
+  vault:
+    server: https://your-openbao-address:8200
+    path: pki/sign/kubernetes
+    auth:
+      kubernetes:
+        mountPath: /v1/auth/kubernetes
+        role: pki-issuer
+    caCertSecretRef:
+      name: openbao-ca
+      key: ca.crt
+
+
