@@ -1,0 +1,10 @@
+# Obtenir les informations du cluster
+KUBE_HOST="https://$(kubectl config view --raw --minify --flatten -o jsonpath='{.clusters[0].cluster.server}' | cut -d'/' -f3)"
+KUBE_CACERT=$(kubectl config view --raw --minify --flatten -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 --decode)
+KUBE_TOKEN=$(kubectl get secret $(kubectl get secret -n kube-system | grep ^kubernetes-admin | awk '{print $1}') -n kube-system -o jsonpath='{.data.token}' | base64 --decode)
+
+# Configurer l'auth Kubernetes dans OpenBao
+bao write auth/kubernetes/config \
+  kubernetes_host="$KUBE_HOST" \
+  kubernetes_ca_cert="$KUBE_CACERT" \
+  token_reviewer_jwt="$KUBE_TOKEN"
