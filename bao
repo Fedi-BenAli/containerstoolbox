@@ -129,5 +129,13 @@ path "auth/token/lookup-self" {
 }
 EOF
 
+
+
+bao write auth/kubernetes/role/pki-issuer \
+  bound_service_account_names=cert-issuer \
+  bound_service_account_namespaces=default,cert-manager \
+  policies=pki-issuer \
+  ttl=24h
+
 # Vérifier la policy
 bao policy read pki-issuer
