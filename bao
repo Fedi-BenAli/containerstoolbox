@@ -99,3 +99,35 @@ bao write pki/config/urls \
   issuing_certificates="https://openbao.example.com/v1/pki/ca" \
   crl_distribution_points="https://openbao.example.com/v1/pki/crl"
 
+
+
+
+
+bao policy write pki-issuer - <<'EOF'
+path "pki/sign/kubernetes" {
+  capabilities = ["create", "update"]
+}
+
+path "pki/issue/kubernetes" {
+  capabilities = ["create", "update"]
+}
+
+path "pki/certs" {
+  capabilities = ["list"]
+}
+
+path "pki/cert/*" {
+  capabilities = ["read"]
+}
+
+path "auth/token/renew-self" {
+  capabilities = ["update"]
+}
+
+path "auth/token/lookup-self" {
+  capabilities = ["read"]
+}
+EOF
+
+# Vérifier la policy
+bao policy read pki-issuer
