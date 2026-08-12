@@ -85,3 +85,17 @@ spec:
       key: ca.crt
 
 
+
+Étape 1.6: Configurer les URLs de certificat
+bash
+
+Collapse
+
+
+ Copy
+
+# Remplacez openbao.example.com par votre domaine réel
+bao write pki/config/urls \
+  issuing_certificates="https://openbao.example.com/v1/pki/ca" \
+  crl_distribution_points="https://openbao.example.com/v1/pki/crl"
+
