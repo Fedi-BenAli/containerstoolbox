@@ -1,141 +1,230 @@
-# Obtenir les informations du cluster
-KUBE_HOST="https://$(kubectl config view --raw --minify --flatten -o jsonpath='{.clusters[0].cluster.server}' | cut -d'/' -f3)"
-KUBE_CACERT=$(kubectl config view --raw --minify --flatten -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 --decode)
-KUBE_TOKEN=$(kubectl get secret $(kubectl get secret -n kube-system | grep ^kubernetes-admin | awk '{print $1}') -n kube-system -o jsonpath='{.data.token}' | base64 --decode)
+Guide : Authentification Kubernetes cross-cluster entre OpenBao et cert-manager
+Contexte et architecture
+Cluster A : héberge OpenBao (fork de HashiCorp Vault), avec le moteur secret PKI configuré (CA racine ou intermédiaire).
+Cluster B : héberge cert-manager, qui doit s'authentifier auprès d'OpenBao (cluster A) pour demander la signature de certificats via un Issuer/ClusterIssuer de type vault.
 
-# Configurer l'auth Kubernetes dans OpenBao
-bao write auth/kubernetes/config \
-  kubernetes_host="$KUBE_HOST" \
-  kubernetes_ca_cert="$KUBE_CACERT" \
-  token_reviewer_jwt="$KUBE_TOKEN"
------------------
+Le point délicat : la méthode d'auth kubernetes d'OpenBao valide normalement les tokens de ServiceAccount en appelant l'API TokenReview du cluster qui a émis le token. Or ici, OpenBao tourne dans le cluster A et les tokens à valider viennent du cluster B. Il faut donc explicitement dire à OpenBao d'aller interroger l'API Kubernetes du cluster B.
 
+Deux approches possibles :
 
+Auth method kubernetes classique, avec OpenBao configuré pour joindre l'API server du cluster B (nécessite connectivité réseau cluster A → API server cluster B).
+Auth method jwt avec validation via JWKS public (OIDC discovery du cluster B), qui évite à OpenBao d'avoir à appeler l'API TokenReview en direct — utile si les deux clusters ne sont pas interconnectés réseau mais que l'issuer OIDC du cluster B est exposé publiquement.
 
+Ce guide couvre principalement l'option 1 (la plus courante), avec une note sur l'option 2 à la fin.
 
-# Créer un namespace pour OpenBao (si ce n'est pas déjà fait)
-kubectl create namespace openbao
+Prérequis
+bao (ou vault) CLI configuré contre l'API d'OpenBao, avec des droits admin.
+kubectl avec accès aux deux clusters (contextes séparés, ex. kubectl --context cluster-a / --context cluster-b).
+cert-manager déjà installé sur le cluster B.
+Connectivité réseau : le pod OpenBao (cluster A) doit pouvoir atteindre l'API server du cluster B sur le port 6443 (ou équivalent), et cert-manager (cluster B) doit pouvoir atteindre l'endpoint HTTPS d'OpenBao (cluster A).
+Le moteur PKI est déjà activé sur OpenBao avec une CA (root ou intermediate) configurée. Si ce n'est pas le cas, il faut le faire avant (bao secrets enable pki, génération/import de la CA, configuration de pki/config/urls, etc.).
+Partie 1 — Côté Cluster B : préparer l'identité pour cert-manager
 
-# Créer le service account
-kubectl create serviceaccount openbao -n openbao
+cert-manager a besoin d'une ServiceAccount dont le token servira à s'authentifier auprès d'OpenBao. On peut utiliser la SA par défaut de cert-manager (cert-manager dans le namespace cert-manager) ou en créer une dédiée — recommandé pour limiter le blast radius.
 
-# Créer un ClusterRoleBinding pour les permissions nécessaires
-kubectl create clusterrolebinding openbao-tokenreview \
-  --clusterrole=system:auth-delegator \
-  --serviceaccount=openbao:openbao
-Étape 2: Récupérer les credentials
+bash
+kubectl --context cluster-b -n cert-manager create serviceaccount vault-issuer
 
-# Obtenir le token du service account
-KUBE_TOKEN=$(kubectl get secret $(kubectl get secret -n openbao -o jsonpath='{.items[?(@.type=="kubernetes.io/service-account-token")].metadata.name}' | head -n1) -n openbao -o jsonpath='{.data.token}' | base64 --decode)
+Depuis cert-manager v1.12+, le connecteur Vault supporte l'authentification via serviceAccountRef, qui utilise des tokens projetés courte-durée (bound service account tokens) au lieu d'un Secret statique — c'est la méthode à privilégier aujourd'hui plutôt que l'ancien Secret JWT statique.
 
-# Obtenir le certificat CA
-KUBE_CACERT=$(kubectl get secret $(kubectl get secret -n openbao -o jsonpath='{.items[?(@.type=="kubernetes.io/service-account-token")].metadata.name}' | head -n1) -n openbao -o jsonpath='{.data.ca\.crt}' | base64 --decode)
+Aucune RBAC particulière n'est requise sur cette SA côté cluster B pour ce rôle (elle sert juste d'identité), sauf si vous utilisez l'option "local token reviewer" (voir plus bas).
 
-# Obtenir l'host du cluster
-KUBE_HOST="https://$(kubectl config view --raw --minify --flatten -o jsonpath='{.clusters[0].cluster.server}' | cut -d'/' -f3)"
+Partie 2 — Récupérer les informations du Cluster B nécessaires à OpenBao
 
-# Vérifier les valeurs
-echo "HOST: $KUBE_HOST"
-echo "TOKEN: $KUBE_TOKEN"
-echo "CACERT: $KUBE_CACERT"
+OpenBao a besoin de 3 choses pour valider les tokens émis par le cluster B :
 
+kubernetes_host : l'URL de l'API server du cluster B.
+kubernetes_ca_cert : le certificat CA du cluster B (pour vérifier le TLS de l'API server).
+token_reviewer_jwt : un token avec les droits system:auth-delegator sur le cluster B, permettant à OpenBao d'appeler l'API TokenReview en son nom.
+2.1 Récupérer l'URL de l'API server
+bash
+kubectl --context cluster-b config view --minify -o jsonpath='{.clusters[0].cluster.server}'
+2.2 Récupérer le CA cert du cluster B
+bash
+kubectl --context cluster-b config view --raw --minify \
+  -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 -d > cluster-b-ca.pem
+2.3 Créer la ServiceAccount "token reviewer" sur le cluster B
 
+Cette SA est utilisée uniquement par OpenBao pour appeler l'API TokenReview — elle est différente de la SA vault-issuer utilisée par cert-manager.
 
+bash
+kubectl --context cluster-b create namespace openbao-auth-delegator --dry-run=client -o yaml | kubectl --context cluster-b apply -f -
 
+kubectl --context cluster-b -n openbao-auth-delegator apply -f - <<EOF
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: openbao-token-reviewer
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: openbao-token-reviewer-token
+  annotations:
+    kubernetes.io/service-account.name: openbao-token-reviewer
+type: kubernetes.io/service-account-token
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: openbao-token-reviewer-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+- kind: ServiceAccount
+  name: openbao-token-reviewer
+  namespace: openbao-auth-delegator
+EOF
 
+Sur les clusters récents (K8s 1.24+), les tokens de SA ne sont plus générés automatiquement en Secret longue-durée — d'où la création explicite du Secret ci-dessus avec l'annotation kubernetes.io/service-account.name. C'est volontairement un token long-lived car OpenBao doit pouvoir l'utiliser en continu ; pensez à le faire tourner régulièrement (rotation manuelle ou via un cronjob).
 
+Récupérez le JWT :
 
+bash
+kubectl --context cluster-b -n openbao-auth-delegator get secret openbao-token-reviewer-token \
+  -o jsonpath='{.data.token}' | base64 -d > reviewer.jwt
+Partie 3 — Côté Cluster A : configurer OpenBao
+3.1 Activer la méthode d'auth Kubernetes
+bash
+bao auth enable -path=kubernetes-cluster-b kubernetes
 
---------------------
+On utilise un path explicite (kubernetes-cluster-b) plutôt que le défaut kubernetes/, utile si vous avez plusieurs clusters clients à l'avenir.
 
-bao policy write pki-issuer - <<EOF
-path "pki/issue/kubernetes" {
+3.2 Configurer la connexion vers le cluster B
+bash
+bao write auth/kubernetes-cluster-b/config \
+  kubernetes_host="https://<API_SERVER_CLUSTER_B>:6443" \
+  kubernetes_ca_cert=@cluster-b-ca.pem \
+  token_reviewer_jwt=@reviewer.jwt \
+  disable_local_ca_jwt=true
+
+disable_local_ca_jwt=true est important : il indique à OpenBao de ne pas utiliser le CA/JWT local du pod (celui du cluster A) mais bien ceux fournis explicitement pour le cluster B.
+
+3.3 Créer une policy autorisant la signature de certificats
+bash
+bao policy write cert-manager-pki - <<EOF
+path "pki/sign/cert-manager-role" {
   capabilities = ["create", "update"]
 }
-
-path "pki/certs" {
-  capabilities = ["list"]
+path "pki/issue/cert-manager-role" {
+  capabilities = ["create", "update"]
 }
 EOF
 
+Adaptez pki/ au mount path réel de votre moteur PKI, et cert-manager-role au rôle PKI que vous avez défini (contraintes sur allowed_domains, max_ttl, etc.).
 
-bao write auth/kubernetes/role/pki-issuer \
-  bound_service_account_names=cert-issuer \
-  bound_service_account_namespaces=default \
-  policies=pki-issuer \
-  ttl=24h
+3.4 Créer le rôle d'auth Kubernetes lié à la SA vault-issuer
+bash
+bao write auth/kubernetes-cluster-b/role/cert-manager \
+  bound_service_account_names=vault-issuer \
+  bound_service_account_namespaces=cert-manager \
+  policies=cert-manager-pki \
+  ttl=15m \
+  max_ttl=1h
 
+Ce rôle restreint strictement l'accès : seule la SA vault-issuer dans le namespace cert-manager du cluster B pourra obtenir un token OpenBao avec la policy cert-manager-pki. TTL court volontairement.
 
-
-
+Partie 4 — Côté Cluster B : configurer l'Issuer cert-manager
+4.1 ClusterIssuer utilisant l'auth Kubernetes native (serviceAccountRef)
+yaml
 apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
 metadata:
-  name: openbao-issuer
+  name: openbao-pki-issuer
 spec:
   vault:
-    server: https://your-openbao-address:8200
-    path: pki/sign/kubernetes
+    server: https://openbao.cluster-a.example.com:8200
+    path: pki/sign/cert-manager-role
+    caBundle: <base64 du CA cert exposant l'API OpenBao, si TLS interne/self-signed>
     auth:
       kubernetes:
-        mountPath: /v1/auth/kubernetes
-        role: pki-issuer
-    caCertSecretRef:
-      name: openbao-ca
-      key: ca.crt
+        role: cert-manager
+        mountPath: /v1/auth/kubernetes-cluster-b
+        serviceAccountRef:
+          name: vault-issuer
 
+Points d'attention :
 
-
-Étape 1.6: Configurer les URLs de certificat
+mountPath doit correspondre exactement au path d'activation choisi en 3.1, préfixé par /v1/auth/.
+path est le chemin PKI utilisé pour signer/émettre (pki/sign/<role> ou pki/issue/<role>).
+caBundle : si OpenBao n'utilise pas un certificat public reconnu (Let's Encrypt public par ex.), fournissez le CA bundle pour que cert-manager fasse confiance au TLS d'OpenBao.
 bash
+kubectl --context cluster-b apply -f cluster-issuer.yaml
+4.2 Tester avec un Certificate
+yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: test-cert
+  namespace: default
+spec:
+  secretName: test-cert-tls
+  issuerRef:
+    name: openbao-pki-issuer
+    kind: ClusterIssuer
+  commonName: test.example.com
+  dnsNames:
+    - test.example.com
+bash
+kubectl --context cluster-b apply -f test-cert.yaml
+kubectl --context cluster-b describe certificate test-cert
+kubectl --context cluster-b get certificaterequest
 
-Collapse
+En cas d'échec, inspectez :
 
+bash
+kubectl --context cluster-b -n cert-manager logs deploy/cert-manager
 
- Copy
+Côté OpenBao, activez l'audit log si besoin pour voir les tentatives d'auth et de signature :
 
-# Remplacez openbao.example.com par votre domaine réel
-bao write pki/config/urls \
-  issuing_certificates="https://openbao.example.com/v1/pki/ca" \
-  crl_distribution_points="https://openbao.example.com/v1/pki/crl"
+bash
+bao audit enable file file_path=/vault/logs/audit.log
+Partie 5 — Sécurité et bonnes pratiques
+TTL courts sur le rôle d'auth Kubernetes (ttl/max_ttl) pour limiter la durée de vie des tokens OpenBao.
+Restreindre bound_service_account_names/namespaces au strict nécessaire — n'utilisez jamais un rôle ouvert à toutes les SA.
+Rotation du token_reviewer_jwt : ce token n'expire pas par défaut sur les anciens clusters ; mettez en place une rotation périodique (recréer le Secret, ré-exécuter bao write .../config).
+mTLS ou au minimum TLS strict entre les deux clusters (OpenBao ne doit jamais être exposé en HTTP, et l'API server du cluster B doit être joint en HTTPS avec vérification du CA).
+Policies PKI restrictives : limitez allowed_domains, enforce_hostnames, max_ttl sur le rôle PKI OpenBao pour éviter qu'un token compromis ne permette d'émettre des certificats arbitraires.
+Firewall/NetworkPolicy : n'autorisez que les flux strictement nécessaires (cluster A → API server cluster B sur 6443 pour TokenReview ; cluster B → OpenBao sur le port API).
+Namespace dédié pour la SA openbao-token-reviewer, avec RBAC minimal (elle n'a besoin que de system:auth-delegator, rien d'autre).
+Alternative : auth method jwt (sans connectivité réseau directe)
 
+Si le cluster A ne peut pas atteindre l'API server du cluster B (environnements cloisonnés, clusters managés sans accès réseau direct), et que le cluster B expose son endpoint OIDC discovery (/.well-known/openid-configuration et JWKS) publiquement ou via un endpoint accessible :
 
+bash
+bao auth enable -path=jwt-cluster-b jwt
 
+bao write auth/jwt-cluster-b/config \
+  oidc_discovery_url="https://<issuer-cluster-b>" \
+  bound_issuer="https://<issuer-cluster-b>"
 
+bao write auth/jwt-cluster-b/role/cert-manager \
+  role_type="jwt" \
+  bound_audiences="https://openbao.cluster-a.example.com" \
+  user_claim="sub" \
+  bound_subject="system:serviceaccount:cert-manager:vault-issuer" \
+  policies=cert-manager-pki \
+  ttl=15m
 
-bao policy write pki-issuer - <<'EOF'
-path "pki/sign/kubernetes" {
-  capabilities = ["create", "update"]
-}
+Côté cert-manager, l'Issuer Vault ne supporte pas nativement jwt comme méthode (uniquement kubernetes, appRole, token), donc cette alternative est surtout pertinente si vous pilotez OpenBao via un autre mécanisme (ex. un webhook custom, ou en repassant par une auth Kubernetes locale relayée). Dans la majorité des cas réels, l'option 1 (kubernetes auth avec connectivité réseau cluster A → cluster B) reste la plus simple et la plus supportée par cert-manager.
 
-path "pki/issue/kubernetes" {
-  capabilities = ["create", "update"]
-}
-
-path "pki/certs" {
-  capabilities = ["list"]
-}
-
-path "pki/cert/*" {
-  capabilities = ["read"]
-}
-
-path "auth/token/renew-self" {
-  capabilities = ["update"]
-}
-
-path "auth/token/lookup-self" {
-  capabilities = ["read"]
-}
-EOF
-
-
-
-bao write auth/kubernetes/role/pki-issuer \
-  bound_service_account_names=cert-issuer \
-  bound_service_account_namespaces=default,cert-manager \
-  policies=pki-issuer \
-  ttl=24h
-
-# Vérifier la policy
-bao policy read pki-issuer
+Résumé du flux
+cert-manager (cluster B)
+   │  1. Demande un token de la SA "vault-issuer" (projeté, courte durée)
+   ▼
+kube-apiserver (cluster B)
+   │  2. Émet le JWT signé
+   ▼
+cert-manager envoie le JWT à OpenBao (cluster A) sur le path kubernetes-cluster-b/login
+   ▼
+OpenBao (cluster A)
+   │  3. Valide le JWT via TokenReview contre l'API server du cluster B
+   │     (en utilisant token_reviewer_jwt)
+   │  4. Vérifie bound_service_account_names/namespaces
+   │  5. Retourne un token OpenBao avec la policy cert-manager-pki
+   ▼
+cert-manager utilise ce token pour appeler pki/sign/cert-manager-role
+   ▼
+OpenBao signe le certificat avec la CA du moteur PKI et le retourne
