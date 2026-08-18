@@ -1,0 +1,43 @@
+Here's a professionally rewritten version of your support message:
+
+Subject: OVN Issue – Missing SNAT Rules for EgressIP on OpenShift Cluster OCP-CBK-PRD-2 (Recurring)
+
+We are currently experiencing an issue with OVN affecting two of our OpenShift clusters, both running version 4.18.19. Worker nodes on these clusters are distributed across two sites: VEGA and SIRIUS.
+
+This case focuses on cluster OCP-CBK-PRD-2, which has encountered this issue twice in the past few days.
+
+Cluster Topology
+
+The cluster consists of 3 master nodes and 4 worker nodes:
+
+Worker1 and Worker3 — VEGA Datacenter
+Worker2 and Worker4 — SIRIUS Datacenter
+
+Due to a known EgressIP assignment bug, we currently restrict EgressIP hosting to Worker1 and Worker2 only, by limiting the egress-assignable labels to these two nodes.
+
+EgressIP Configuration
+
+EgressIP is used across all client namespaces on this cluster, with a dedicated EgressIP per application (each covering one or more namespaces). Each EgressIP resource is configured with two IP addresses — one per datacenter.
+
+Under normal operation, every pod in a client namespace should have two SNAT rules in the OVN database, corresponding to the two IPs defined in the EgressIP resource.
+
+Issue Description
+
+Intermittently, the cluster begins creating pods with only a single SNAT rule instead of two. From that point forward, any newly created or restarted pod is provisioned without the second SNAT rule.
+
+In this occurrence on OCP-CBK-PRD-2, all newly created/restarted pods were missing the SNAT rule for the SIRIUS IP. As a result, egress traffic from affected pods was blocked entirely, causing a significant client-facing impact due to loss of pod-level connectivity.
+
+Remediation Steps Taken
+
+To resolve the issue, we performed the following actions:
+
+Rolled out the OVN control-plane
+Rolled out the OVN kube-node components
+Migrated all SIRIUS EgressIP assignments from Worker2 to Worker4 by updating the OVN labels
+Rolled out client workloads in select namespaces to restore correct pod configuration
+
+Additional Notes
+
+No errors were observed in the OVN pod logs (control-plane or ovn-kube-node) during the incident.
+
+We will attach the must-gather for the cluster. Please note that we had to restart the entire OVN layer to restore service, which may affect the diagnostic data captured.
