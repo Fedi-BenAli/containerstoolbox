@@ -1,0 +1,5 @@
+curl -s localhost:19000/config_dump | jq '.. | objects | select(has("filter_chain_match")) | .filter_chain_match'
+
+curl -s localhost:19000/config_dump | jq '.configs[] | select(.["@type"] | contains("ListenersConfigDump")) | .dynamic_listeners[] | select(.name | contains("10443"))'
+
+curl -s localhost:19000/config_dump | jq '.. | objects | select(has("filter_chain_match")) | .filter_chain_match'
