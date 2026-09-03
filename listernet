@@ -7,3 +7,5 @@ curl -s localhost:19000/config_dump | jq '.. | objects | select(has("filter_chai
 curl -s localhost:19000/config_dump | jq '.. | objects | select(has("listener_filters")) | .listener_filters[].name'
 
 curl -s localhost:19000/config_dump | jq '.. | objects | select(has("filter_chains")) | {default: .default_filter_chain, count: (.filter_chains | length)}'
+
+kubectl get secret kubo-registry-tls -n <ns-harbor> -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -subject
