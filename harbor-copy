@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+#
+# migrate_helm_charts.sh
+#
+# Downloads all Helm chart artifacts from a Harbor project on one Harbor
+# instance and pushes them to a project of the same name on another Harbor
+# instance, using Helm's native OCI support (Helm >= 3.8).
+#
+# Requires: helm, curl, jq
+#
+# ---------------------------------------------------------------------------
+# Configuration - set these via environment variables before running, e.g.:
+#
+#   export SRC_HARBOR_HOST="harbor1.example.com"
+#   export SRC_HARBOR_USER="admin"
+#   export SRC_HARBOR_PASS="xxxxx"
+#
+#   export DST_HARBOR_HOST="harbor2.example.com"
+#   export DST_HARBOR_USER="admin"
+#   export DST_HARBOR_PASS="xxxxx"
+#
+#   export PROJECT="kubo-gitops"
+#
+#   ./migrate_helm_charts.sh
+#
+# ---------------------------------------------------------------------------
+
+set -euo pipefail
+
+: "${SRC_HARBOR_HOST:?Set SRC_HARBOR_HOST, e.g. harbor1.example.com}"
+: "${SRC_HARBOR_USER:?Set SRC_HARBOR_USER}"
+: "${SRC_HARBOR_PASS:?Set SRC_HARBOR_PASS}"
+
+: "${DST_HARBOR_HOST:?Set DST_HARBOR_HOST, e.g. harbor2.example.com}"
+: "${DST_HARBOR_USER:?Set DST_HARBOR_USER}"
+: "${DST_HARBOR_PASS:?Set DST_HARBOR_PASS}"
+
+PROJECT="${PROJECT:-kubo-gitops}"
+WORKDIR="$(mktemp -d)"
+PAGE_SIZE=100
+
+echo ">> Working directory: ${WORKDIR}"
+trap 'echo ">> Cleaning up ${WORKDIR}"; rm -rf "${WORKDIR}"' EXIT
+
+for bin in helm curl jq; do
+  command -v "${bin}" >/dev/null 2>&1 || { echo "ERROR: '${bin}' is required but not installed." >&2; exit 1; }
+done
+
+echo ">> Logging in to source and destination registries via helm..."
+echo "${SRC_HARBOR_PASS}" | helm registry login "${SRC_HARBOR_HOST}" \
+  --username "${SRC_HARBOR_USER}" --password-stdin
+
+echo "${DST_HARBOR_PASS}" | helm registry login "${DST_HARBOR_HOST}" \
+  --username "${DST_HARBOR_USER}" --password-stdin
+
+# ---------------------------------------------------------------------------
+# 1. Discover Harbor repositories under the project.
+#    In Harbor's OCI model, each Helm chart is stored as its own "repository"
+#    under the project (e.g. kubo-gitops/mychart), with one or more tags
+#    representing chart versions.
+# ---------------------------------------------------------------------------
+
+echo ">> Fetching repository list for project '${PROJECT}' from ${SRC_HARBOR_HOST}..."
+
+page=1
+repos=()
+while :; do
+  resp="$(curl -sf -u "${SRC_HARBOR_USER}:${SRC_HARBOR_PASS}" \
+    "https://${SRC_HARBOR_HOST}/api/v2.0/projects/${PROJECT}/repositories?page=${page}&page_size=${PAGE_SIZE}")"
+
+  count="$(echo "${resp}" | jq 'length')"
+  [[ "${count}" -eq 0 ]] && break
+
+  while IFS= read -r name; do
+    repos+=("${name}")
+  done < <(echo "${resp}" | jq -r '.[].name')
+
+  [[ "${count}" -lt "${PAGE_SIZE}" ]] && break
+  page=$((page + 1))
+done
+
+if [[ "${#repos[@]}" -eq 0 ]]; then
+  echo "No repositories found under project '${PROJECT}' on ${SRC_HARBOR_HOST}. Nothing to do."
+  exit 0
+fi
+
+echo ">> Found ${#repos[@]} repositories:"
+printf '   - %s\n' "${repos[@]}"
+
+# ---------------------------------------------------------------------------
+# 2. For each repository, list its artifacts (chart versions/tags), then
+#    for each tag: helm pull (as OCI) and helm push to the destination.
+# ---------------------------------------------------------------------------
+
+total_charts=0
+failed=()
+
+for full_repo in "${repos[@]}"; do
+  # full_repo looks like "kubo-gitops/mychart" - strip the project prefix
+  # for use in Harbor's artifact-listing endpoint, and URL-encode any slash
+  # in the chart name itself (e.g. subcharts stored with nested paths).
+  repo_name="${full_repo#${PROJECT}/}"
+  encoded_repo_name="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "${repo_name}")"
+
+  echo ""
+  echo ">> Processing chart repository: ${full_repo}"
+
+  artifacts_resp="$(curl -sf -u "${SRC_HARBOR_USER}:${SRC_HARBOR_PASS}" \
+    "https://${SRC_HARBOR_HOST}/api/v2.0/projects/${PROJECT}/repositories/${encoded_repo_name}/artifacts?page_size=${PAGE_SIZE}")"
+
+  tags="$(echo "${artifacts_resp}" | jq -r '.[].tags[]?.name' | sort -u)"
+
+  if [[ -z "${tags}" ]]; then
+    echo "   No tags found for ${full_repo}, skipping."
+    continue
+  fi
+
+  while IFS= read -r tag; do
+    [[ -z "${tag}" ]] && continue
+    src_ref="oci://${SRC_HARBOR_HOST}/${PROJECT}/${repo_name}"
+    dst_repo_ref="oci://${DST_HARBOR_HOST}/${PROJECT}"
+
+    echo "   -> pulling ${repo_name}:${tag}"
+    if ! helm pull "${src_ref}" --version "${tag}" -d "${WORKDIR}" >/dev/null; then
+      echo "      FAILED to pull ${repo_name}:${tag}"
+      failed+=("${repo_name}:${tag} (pull)")
+      continue
+    fi
+
+    chart_tgz="${WORKDIR}/${repo_name}-${tag}.tgz"
+    if [[ ! -f "${chart_tgz}" ]]; then
+      # helm names the file after the chart's actual name/version in Chart.yaml,
+      # which may differ slightly from repo_name/tag - find the most recent .tgz.
+      chart_tgz="$(ls -t "${WORKDIR}"/*.tgz | head -n1)"
+    fi
+
+    echo "   -> pushing $(basename "${chart_tgz}") to ${dst_repo_ref}"
+    if ! helm push "${chart_tgz}" "${dst_repo_ref}" >/dev/null; then
+      echo "      FAILED to push ${repo_name}:${tag}"
+      failed+=("${repo_name}:${tag} (push)")
+      rm -f "${chart_tgz}"
+      continue
+    fi
+
+    rm -f "${chart_tgz}"
+    total_charts=$((total_charts + 1))
+    echo "      OK: ${repo_name}:${tag}"
+  done <<< "${tags}"
+done
+
+echo ""
+echo "=============================================="
+echo "Migration complete."
+echo "Charts migrated: ${total_charts}"
+if [[ "${#failed[@]}" -gt 0 ]]; then
+  echo "Failures (${#failed[@]}):"
+  printf '   - %s\n' "${failed[@]}"
+  exit 1
+fi
+echo "=============================================="
