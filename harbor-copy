@@ -158,3 +158,16 @@ if [[ "${#failed[@]}" -gt 0 ]]; then
   exit 1
 fi
 echo "=============================================="
+
+
+#############
+
+export SRC_HARBOR_HOST="harbor1.example.com"
+export SRC_HARBOR_USER="admin"
+export SRC_HARBOR_PASS="xxxxx"
+
+export DST_HARBOR_HOST="harbor2.example.com"
+export DST_HARBOR_USER="admin"
+export DST_HARBOR_PASS="xxxxx"
+
+export PROJECT="kubo-gitops"   # already the default
