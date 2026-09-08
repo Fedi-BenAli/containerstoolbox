@@ -8,6 +8,11 @@
 #
 # Requires: helm, curl, jq
 #
+# NOTE: TLS certificate verification is disabled for BOTH Harbor instances
+# (helm --insecure / --insecure-skip-tls-verify, curl -k). Only use this
+# against registries you trust (e.g. self-signed certs in a private/internal
+# environment) - it will not detect a MITM.
+#
 # ---------------------------------------------------------------------------
 # Configuration - set these via environment variables before running, e.g.:
 #
@@ -46,12 +51,12 @@ for bin in helm curl jq; do
   command -v "${bin}" >/dev/null 2>&1 || { echo "ERROR: '${bin}' is required but not installed." >&2; exit 1; }
 done
 
-echo ">> Logging in to source and destination registries via helm..."
+echo ">> Logging in to source and destination registries via helm (TLS verification disabled)..."
 echo "${SRC_HARBOR_PASS}" | helm registry login "${SRC_HARBOR_HOST}" \
-  --username "${SRC_HARBOR_USER}" --password-stdin
+  --username "${SRC_HARBOR_USER}" --password-stdin --insecure
 
 echo "${DST_HARBOR_PASS}" | helm registry login "${DST_HARBOR_HOST}" \
-  --username "${DST_HARBOR_USER}" --password-stdin
+  --username "${DST_HARBOR_USER}" --password-stdin --insecure
 
 # ---------------------------------------------------------------------------
 # 1. Discover Harbor repositories under the project.
@@ -65,7 +70,7 @@ echo ">> Fetching repository list for project '${PROJECT}' from ${SRC_HARBOR_HOS
 page=1
 repos=()
 while :; do
-  resp="$(curl -sf -u "${SRC_HARBOR_USER}:${SRC_HARBOR_PASS}" \
+  resp="$(curl -sfk -u "${SRC_HARBOR_USER}:${SRC_HARBOR_PASS}" \
     "https://${SRC_HARBOR_HOST}/api/v2.0/projects/${PROJECT}/repositories?page=${page}&page_size=${PAGE_SIZE}")"
 
   count="$(echo "${resp}" | jq 'length')"
@@ -105,7 +110,7 @@ for full_repo in "${repos[@]}"; do
   echo ""
   echo ">> Processing chart repository: ${full_repo}"
 
-  artifacts_resp="$(curl -sf -u "${SRC_HARBOR_USER}:${SRC_HARBOR_PASS}" \
+  artifacts_resp="$(curl -sfk -u "${SRC_HARBOR_USER}:${SRC_HARBOR_PASS}" \
     "https://${SRC_HARBOR_HOST}/api/v2.0/projects/${PROJECT}/repositories/${encoded_repo_name}/artifacts?page_size=${PAGE_SIZE}")"
 
   tags="$(echo "${artifacts_resp}" | jq -r '.[].tags[]?.name' | sort -u)"
@@ -121,7 +126,7 @@ for full_repo in "${repos[@]}"; do
     dst_repo_ref="oci://${DST_HARBOR_HOST}/${PROJECT}"
 
     echo "   -> pulling ${repo_name}:${tag}"
-    if ! helm pull "${src_ref}" --version "${tag}" -d "${WORKDIR}" >/dev/null; then
+    if ! helm pull "${src_ref}" --version "${tag}" -d "${WORKDIR}" --insecure-skip-tls-verify >/dev/null; then
       echo "      FAILED to pull ${repo_name}:${tag}"
       failed+=("${repo_name}:${tag} (pull)")
       continue
@@ -135,7 +140,7 @@ for full_repo in "${repos[@]}"; do
     fi
 
     echo "   -> pushing $(basename "${chart_tgz}") to ${dst_repo_ref}"
-    if ! helm push "${chart_tgz}" "${dst_repo_ref}" >/dev/null; then
+    if ! helm push "${chart_tgz}" "${dst_repo_ref}" --insecure-skip-tls-verify >/dev/null; then
       echo "      FAILED to push ${repo_name}:${tag}"
       failed+=("${repo_name}:${tag} (push)")
       rm -f "${chart_tgz}"
@@ -158,16 +163,3 @@ if [[ "${#failed[@]}" -gt 0 ]]; then
   exit 1
 fi
 echo "=============================================="
-
-
-#############
-
-export SRC_HARBOR_HOST="harbor1.example.com"
-export SRC_HARBOR_USER="admin"
-export SRC_HARBOR_PASS="xxxxx"
-
-export DST_HARBOR_HOST="harbor2.example.com"
-export DST_HARBOR_USER="admin"
-export DST_HARBOR_PASS="xxxxx"
-
-export PROJECT="kubo-gitops"   # already the default
