@@ -1,0 +1,41 @@
+openssl genrsa -out app.example.internal.key 2048
+
+openssl req -new \
+  -key app.example.internal.key \
+  -out app.example.internal.csr \
+  -subj "/CN=app.example.internal"
+
+
+
+cat > app.example.internal.ext <<'EOF'
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=@alt_names
+
+[alt_names]
+DNS.1=app.example.internal
+DNS.2=www.app.example.internal
+EOF
+
+
+openssl x509 -req \
+  -in app.example.internal.csr \
+  -CA my-ca.crt \
+  -CAkey my-ca.key \
+  -CAcreateserial \
+  -out app.example.internal.crt \
+  -days 365 \
+  -sha256 \
+  -extfile app.example.internal.ext
+
+
+openssl verify -CAfile my-ca.crt app.example.internal.crt
+
+
+kubectl create secret tls app-example-internal-tls \
+  --cert=app.example.internal.crt \
+  --key=app.example.internal.key \
+  -n my-namespace
+
+
