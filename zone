@@ -1,0 +1,17 @@
+bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Get the zone label for every node, one per line
+zones=$(oc get nodes -o jsonpath='{range .items[*]}{.metadata.labels.topology\.kubernetes\.io/zone}{"\n"}{end}')
+
+# Count distinct, non-empty zones
+distinct_zone_count=$(echo "$zones" | sed '/^$/d' | sort -u | wc -l)
+
+if [ "$distinct_zone_count" -le 1 ]; then
+    echo "All nodes are in the same datacenter (zone). Skipping mycheck.sh."
+    exit 0
+else
+    echo "Nodes span multiple datacenters (zones: $(echo "$zones" | sort -u | tr '\n' ' ')). Running mycheck.sh..."
+    ./mycheck.sh
+fi
