@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+#
+# recreate_registries_and_proxy_projects.sh
+#
+# Recreates, on a destination Harbor instance, the "Registries" (replication
+# endpoints, Administration > Registries) and the proxy-cache projects that
+# reference them from a source Harbor instance.
+#
+# Requires: curl, jq
+#
+# ---------------------------------------------------------------------------
+# IMPORTANT - registry credentials:
+# Harbor NEVER returns a stored registry's secret/password via the API (only
+# the access_key/username is returned). To recreate registries with working
+# credentials, supply a JSON file mapping registry name -> secret:
+#
+#   {
+#     "dockerhub-proxy": "my-secret-or-token",
+#     "quay-proxy": "another-secret"
+#   }
+#
+# via REGISTRY_CREDENTIALS_FILE. Any registry not present in that file will
+# be created with an empty secret and flagged in the summary at the end -
+# you'll need to set its credential manually in the Harbor UI afterwards.
+# ---------------------------------------------------------------------------
+#
+# Configuration - set via environment variables, e.g.:
+#
+#   export SRC_HARBOR_HOST="harbor1.example.com"
+#   export SRC_HARBOR_USER="admin"
+#   export SRC_HARBOR_PASS="xxxxx"
+#
+#   export DST_HARBOR_HOST="harbor2.example.com"
+#   export DST_HARBOR_USER="admin"
+#   export DST_HARBOR_PASS="xxxxx"
+#
+#   export REGISTRY_CREDENTIALS_FILE="./registry_secrets.json"   # optional
+#
+#   ./recreate_registries_and_proxy_projects.sh
+#
+# NOTE: TLS certificate verification is disabled for BOTH Harbor instances
+# (curl -k). Only use this against registries you trust.
+# ---------------------------------------------------------------------------
+
+set -euo pipefail
+
+: "${SRC_HARBOR_HOST:?Set SRC_HARBOR_HOST, e.g. harbor1.example.com}"
+: "${SRC_HARBOR_USER:?Set SRC_HARBOR_USER}"
+: "${SRC_HARBOR_PASS:?Set SRC_HARBOR_PASS}"
+
+: "${DST_HARBOR_HOST:?Set DST_HARBOR_HOST, e.g. harbor2.example.com}"
+: "${DST_HARBOR_USER:?Set DST_HARBOR_USER}"
+: "${DST_HARBOR_PASS:?Set DST_HARBOR_PASS}"
+
+REGISTRY_CREDENTIALS_FILE="${REGISTRY_CREDENTIALS_FILE:-}"
+PAGE_SIZE=100
+
+SRC_API="https://${SRC_HARBOR_HOST}/api/v2.0"
+DST_API="https://${DST_HARBOR_HOST}/api/v2.0"
+
+for bin in curl jq; do
+  command -v "${bin}" >/dev/null 2>&1 || { echo "ERROR: '${bin}' is required but not installed." >&2; exit 1; }
+done
+
+if [[ -n "${REGISTRY_CREDENTIALS_FILE}" && ! -f "${REGISTRY_CREDENTIALS_FILE}" ]]; then
+  echo "ERROR: REGISTRY_CREDENTIALS_FILE '${REGISTRY_CREDENTIALS_FILE}' not found." >&2
+  exit 1
+fi
+
+src_curl() { curl -sfk -u "${SRC_HARBOR_USER}:${SRC_HARBOR_PASS}" "$@"; }
+dst_curl() { curl -sfk -u "${DST_HARBOR_USER}:${DST_HARBOR_PASS}" "$@"; }
+
+# Generic paginated GET against the Harbor v2 API. Prints the concatenated
+# JSON array to stdout.
+paginated_get() {
+  local base_url="$1"
+  local curl_fn="$2"
+  local page=1
+  local all="[]"
+
+  while :; do
+    resp="$(${curl_fn} "${base_url}$( [[ "${base_url}" == *\?* ]] && echo '&' || echo '?')page=${page}&page_size=${PAGE_SIZE}")"
+    count="$(echo "${resp}" | jq 'length')"
+    [[ "${count}" -eq 0 ]] && break
+    all="$(jq -s '.[0] + .[1]' <(echo "${all}") <(echo "${resp}"))"
+    [[ "${count}" -lt "${PAGE_SIZE}" ]] && break
+    page=$((page + 1))
+  done
+
+  echo "${all}"
+}
+
+registry_secret_for() {
+  local name="$1"
+  if [[ -n "${REGISTRY_CREDENTIALS_FILE}" ]]; then
+    jq -r --arg n "${name}" '.[$n] // empty' "${REGISTRY_CREDENTIALS_FILE}"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 1. Fetch registries from the source Harbor.
+# ---------------------------------------------------------------------------
+
+echo ">> Fetching registries from ${SRC_HARBOR_HOST}..."
+src_registries="$(paginated_get "${SRC_API}/registries" src_curl)"
+reg_count="$(echo "${src_registries}" | jq 'length')"
+echo ">> Found ${reg_count} registries."
+
+echo ">> Fetching existing registries on ${DST_HARBOR_HOST} (to avoid duplicates)..."
+dst_registries_existing="$(paginated_get "${DST_API}/registries" dst_curl)"
+
+declare -A OLD_TO_NEW_REGISTRY_ID
+missing_secret_registries=()
+created_registries=()
+skipped_registries=()
+
+for row in $(echo "${src_registries}" | jq -r '.[] | @base64'); do
+  reg() { echo "${row}" | base64 --decode | jq -r "${1}"; }
+
+  old_id="$(reg '.id')"
+  name="$(reg '.name')"
+  rtype="$(reg '.type')"
+  url="$(reg '.url')"
+  insecure="$(reg '.insecure')"
+  description="$(reg '.description // empty')"
+  cred_type="$(reg '.credential.type // "basic"')"
+  access_key="$(reg '.credential.access_key // empty')"
+
+  echo ""
+  echo ">> Registry: ${name} (id=${old_id}, type=${rtype}, url=${url})"
+
+  existing_id="$(echo "${dst_registries_existing}" | jq -r --arg n "${name}" '.[] | select(.name==$n) | .id' | head -n1)"
+  if [[ -n "${existing_id}" && "${existing_id}" != "null" ]]; then
+    echo "   Already exists on ${DST_HARBOR_HOST} (id=${existing_id}) - skipping creation, reusing id."
+    OLD_TO_NEW_REGISTRY_ID["${old_id}"]="${existing_id}"
+    skipped_registries+=("${name}")
+    continue
+  fi
+
+  secret="$(registry_secret_for "${name}")"
+  if [[ -z "${secret}" ]]; then
+    echo "   WARNING: no secret found in credentials file for '${name}' - creating with empty secret."
+    missing_secret_registries+=("${name}")
+  fi
+
+  payload="$(jq -n \
+    --arg name "${name}" \
+    --arg type "${rtype}" \
+    --arg url "${url}" \
+    --arg description "${description}" \
+    --argjson insecure "${insecure}" \
+    --arg cred_type "${cred_type}" \
+    --arg access_key "${access_key}" \
+    --arg access_secret "${secret}" \
+    '{
+      name: $name,
+      type: $type,
+      url: $url,
+      description: $description,
+      insecure: $insecure,
+      credential: {
+        type: $cred_type,
+        access_key: $access_key,
+        access_secret: $access_secret
+      }
+    }')"
+
+  location="$(dst_curl -i -X POST "${DST_API}/registries" \
+    -H "Content-Type: application/json" -d "${payload}" | tr -d '\r' | awk -F': ' '/^Location:/ {print $2}')"
+
+  if [[ -z "${location}" ]]; then
+    echo "   ERROR: failed to create registry '${name}' on ${DST_HARBOR_HOST}." >&2
+    continue
+  fi
+
+  new_id="$(basename "${location}")"
+  echo "   Created on ${DST_HARBOR_HOST} with id=${new_id}."
+  OLD_TO_NEW_REGISTRY_ID["${old_id}"]="${new_id}"
+  created_registries+=("${name}")
+done
+
+# ---------------------------------------------------------------------------
+# 2. Fetch proxy-cache projects from the source Harbor (projects whose
+#    registry_id points at one of the registries above), and recreate them.
+# ---------------------------------------------------------------------------
+
+echo ""
+echo ">> Fetching projects from ${SRC_HARBOR_HOST}..."
+src_projects="$(paginated_get "${SRC_API}/projects" src_curl)"
+
+proxy_projects="$(echo "${src_projects}" | jq '[.[] | select(.registry_id != null)]')"
+proxy_count="$(echo "${proxy_projects}" | jq 'length')"
+echo ">> Found ${proxy_count} proxy-cache projects."
+
+echo ">> Fetching existing projects on ${DST_HARBOR_HOST} (to avoid duplicates)..."
+dst_projects_existing="$(paginated_get "${DST_API}/projects" dst_curl)"
+
+created_projects=()
+skipped_projects=()
+failed_projects=()
+
+for row in $(echo "${proxy_projects}" | jq -r '.[] | @base64'); do
+  proj() { echo "${row}" | base64 --decode | jq -r "${1}"; }
+
+  pname="$(proj '.name')"
+  old_reg_id="$(proj '.registry_id')"
+  is_public="$(proj '.metadata.public // "false"')"
+
+  echo ""
+  echo ">> Project: ${pname} (source registry_id=${old_reg_id})"
+
+  if echo "${dst_projects_existing}" | jq -e --arg n "${pname}" '.[] | select(.name==$n)' >/dev/null; then
+    echo "   Already exists on ${DST_HARBOR_HOST} - skipping."
+    skipped_projects+=("${pname}")
+    continue
+  fi
+
+  new_reg_id="${OLD_TO_NEW_REGISTRY_ID[${old_reg_id}]:-}"
+  if [[ -z "${new_reg_id}" ]]; then
+    echo "   ERROR: no matching destination registry for source registry_id=${old_reg_id} - skipping project." >&2
+    failed_projects+=("${pname}")
+    continue
+  fi
+
+  payload="$(jq -n \
+    --arg name "${pname}" \
+    --argjson registry_id "${new_reg_id}" \
+    --arg is_public "${is_public}" \
+    '{
+      project_name: $name,
+      registry_id: $registry_id,
+      metadata: {
+        public: $is_public
+      }
+    }')"
+
+  if dst_curl -X POST "${DST_API}/projects" -H "Content-Type: application/json" -d "${payload}" >/dev/null; then
+    echo "   Created on ${DST_HARBOR_HOST}, linked to registry_id=${new_reg_id}."
+    created_projects+=("${pname}")
+  else
+    echo "   ERROR: failed to create project '${pname}' on ${DST_HARBOR_HOST}." >&2
+    failed_projects+=("${pname}")
+  fi
+done
+
+# ---------------------------------------------------------------------------
+# 3. Summary
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=============================================="
+echo "Summary"
+echo "=============================================="
+echo "Registries created:  ${#created_registries[@]}"
+printf '   - %s\n' "${created_registries[@]:-}"
+echo "Registries skipped (already existed): ${#skipped_registries[@]}"
+printf '   - %s\n' "${skipped_registries[@]:-}"
+if [[ "${#missing_secret_registries[@]}" -gt 0 ]]; then
+  echo "Registries created WITHOUT a secret (fix manually in the UI):"
+  printf '   - %s\n' "${missing_secret_registries[@]}"
+fi
+echo ""
+echo "Proxy-cache projects created: ${#created_projects[@]}"
+printf '   - %s\n' "${created_projects[@]:-}"
+echo "Proxy-cache projects skipped (already existed): ${#skipped_projects[@]}"
+printf '   - %s\n' "${skipped_projects[@]:-}"
+if [[ "${#failed_projects[@]}" -gt 0 ]]; then
+  echo "Proxy-cache projects FAILED:"
+  printf '   - %s\n' "${failed_projects[@]}"
+  exit 1
+fi
+echo "=============================================="
