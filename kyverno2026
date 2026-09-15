@@ -1,0 +1,50 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: forbid-poddisruptionbudget
+  annotations:
+    policies.kyverno.io/title: Interdire les PodDisruptionBudget
+    policies.kyverno.io/description: Empêche la création de ressources PodDisruptionBudget.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+    - name: block-pdb-creation
+      match:
+        resources:
+          kinds:
+            - PodDisruptionBudget
+      validate:
+        message: "La création de PodDisruptionBudget n'est pas autorisée sur ce cluster."
+        deny: {}
+
+
+########################
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: deny-secret-service-account-token-type
+  annotations:
+    policies.kyverno.io/title: Interdire le type de Secret 'kubernetes.io/service-account-token'
+    policies.kyverno.io/description: Empêche la création de Secrets de type 'kubernetes.io/service-account-token'.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+    - name: block-service-account-token-secret
+      match:
+        resources:
+          kinds:
+            - Secret
+      validate:
+        message: "La création de Secrets de type 'kubernetes.io/service-account-token' est interdite."
+        deny:
+          conditions:
+            all:
+              - key: "{{request.object.type || ''}}"
+                operator: Equals
+                value: "kubernetes.io/service-account-token"
+
+
+####
+
