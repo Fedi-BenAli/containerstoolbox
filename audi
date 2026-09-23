@@ -5,3 +5,14 @@ echo "$KUBE_API_AUDIENCE"
 
 kubectl create token vault-issuer -n cert-manager --audience="vault://cert-manager-clusterissuer" --audience="$KUBE_API_AUDIENCE" \
   | cut -d. -f2 | base64 -d 2>/dev/null | jq
+
+
+kubectl get secret -n kube-system \
+  $(kubectl get sa default -n kube-system -o jsonpath='{.secrets[0].name}') \
+  -o jsonpath='{.data.ca\.crt}' | base64 -d > cluster-a-ca.crt
+
+
+kubectl config view --raw --minify --flatten \
+  -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 -d > cluster-a-ca.crt
+
+
