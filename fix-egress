@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+#
+# fix-egressip.sh <nom-egressip> [--dry-run]
+#
+# Répare un objet EgressIP dont une ou deux IP ne sont assignées à aucun noeud :
+#   - retire l'IP non assignée de spec.egressIPs
+#   - supprime l'IP résiduelle de br-ex sur les noeuds
+#   - remet l'IP dans l'EgressIP (même position) et vérifie l'assignation
+#
+# Prérequis : oc (connecté en cluster-admin), jq
+#
+# Variables d'environnement optionnelles :
+#   BR_IF=br-ex            interface à nettoyer
+#   NODE_SELECTOR=node-role.kubernetes.io/worker   sélecteur des noeuds à inspecter
+#   WAIT_TIMEOUT=120       délai max (s) pour la vérification
+#   WAIT_REMOVE=10         pause (s) après retrait de l'IP de l'EgressIP
+
+set -uo pipefail
+
+BR_IF="${BR_IF:-br-ex}"
+NODE_SELECTOR="${NODE_SELECTOR:-node-role.kubernetes.io/worker}"
+WAIT_TIMEOUT="${WAIT_TIMEOUT:-120}"
+WAIT_REMOVE="${WAIT_REMOVE:-10}"
+DRY_RUN=0
+
+EGRESS="${1:-}"
+[[ "${2:-}" == "--dry-run" ]] && DRY_RUN=1
+
+log()  { echo "[$(date +%H:%M:%S)] $*"; }
+err()  { echo "[$(date +%H:%M:%S)] ERREUR: $*" >&2; }
+run()  { if (( DRY_RUN )); then log "(dry-run) $*"; else "$@"; fi; }
+
+usage() {
+  echo "Usage: $0 <nom-egressip> [--dry-run]"
+  exit 1
+}
+
+[[ -z "$EGRESS" ]] && usage
+command -v oc >/dev/null || { err "oc introuvable"; exit 1; }
+command -v jq >/dev/null || { err "jq introuvable"; exit 1; }
+oc get egressip "$EGRESS" >/dev/null 2>&1 || { err "EgressIP '$EGRESS' introuvable"; exit 1; }
+
+# ---------- Fonctions utilitaires ----------
+
+# Liste des IP définies dans spec.egressIPs (une par ligne, ordre conservé)
+get_spec_ips() {
+  oc get egressip "$EGRESS" -o json | jq -r '.spec.egressIPs[]'
+}
+
+# Liste des IP effectivement assignées (status.items)
+get_assigned_ips() {
+  oc get egressip "$EGRESS" -o json | jq -r '.status.items[]?.egressIP'
+}
+
+# Noeud auquel l'IP est assignée (vide si aucun)
+get_assigned_node() {
+  local ip="$1"
+  oc get egressip "$EGRESS" -o json \
+    | jq -r --arg ip "$ip" '.status.items[]? | select(.egressIP==$ip) | .node'
+}
+
+# Remplace spec.egressIPs par la liste passée en argument (merge patch)
+set_spec_ips() {
+  local json
+  json=$(printf '%s\n' "$@" | jq -R . | jq -s -c '{spec:{egressIPs:.}}')
+  run oc patch egressip "$EGRESS" --type=merge -p "$json" >/dev/null
+}
+
+# Supprime l'IP de l'interface $BR_IF sur tous les noeuds où elle est présente
+purge_ip_from_nodes() {
+  local ip="$1" node cidrs cidr found=0
+  for node in $(oc get nodes -l "$NODE_SELECTOR" -o name | sed 's#node/##'); do
+    cidrs=$(oc debug "node/$node" -q -- chroot /host \
+              ip -o -4 addr show dev "$BR_IF" 2>/dev/null \
+            | awk '{print $4}' | grep -E "^${ip//./\\.}/" || true)
+    for cidr in $cidrs; do
+      found=1
+      log "  -> $ip trouvée sur $BR_IF de $node ($cidr), suppression"
+      run oc debug "node/$node" -q -- chroot /host ip addr del "$cidr" dev "$BR_IF" \
+        || err "échec de la suppression de $cidr sur $node"
+    done
+  done
+  (( found )) || log "  -> $ip absente de $BR_IF sur les noeuds ($NODE_SELECTOR)"
+}
+
+# Attend que l'IP soit assignée à un noeud
+wait_assigned() {
+  local ip="$1" elapsed=0 node
+  while (( elapsed < WAIT_TIMEOUT )); do
+    node=$(get_assigned_node "$ip")
+    if [[ -n "$node" ]]; then
+      log "  OK : $ip assignée au noeud $node"
+      return 0
+    fi
+    sleep 5; elapsed=$((elapsed+5))
+  done
+  err "$ip toujours non assignée après ${WAIT_TIMEOUT}s"
+  return 1
+}
+
+# Répare une IP : retrait EgressIP -> purge br-ex -> remise EgressIP -> vérification
+repair_ip() {
+  local ip="$1" original_list remaining i
+  mapfile -t original_list < <(get_spec_ips)
+
+  log "=== Réparation de $ip ==="
+
+  # 1. retrait de l'IP depuis l'EgressIP
+  remaining=()
+  for i in "${original_list[@]}"; do [[ "$i" != "$ip" ]] && remaining+=("$i"); done
+  log "1) Retrait de $ip de l'EgressIP $EGRESS"
+  if (( ${#remaining[@]} == 0 )); then
+    err "impossible de retirer la seule IP de l'objet, abandon"
+    return 1
+  fi
+  set_spec_ips "${remaining[@]}"
+  (( DRY_RUN )) || sleep "$WAIT_REMOVE"
+
+  # 2. purge de br-ex
+  log "2) Suppression de $ip de $BR_IF sur les noeuds"
+  purge_ip_from_nodes "$ip"
+
+  # 3. remise de l'IP (ordre d'origine conservé)
+  log "3) Remise de $ip dans l'EgressIP"
+  set_spec_ips "${original_list[@]}"
+
+  if (( DRY_RUN )); then return 0; fi
+  log "   Vérification de l'assignation..."
+  wait_assigned "$ip"
+}
+
+# ---------- Programme principal ----------
+
+mapfile -t SPEC_IPS < <(get_spec_ips)
+mapfile -t ASSIGNED  < <(get_assigned_ips)
+
+log "EgressIP : $EGRESS"
+log "IP définies  : ${SPEC_IPS[*]:-aucune}"
+log "IP assignées : ${ASSIGNED[*]:-aucune}"
+
+MISSING=()
+for ip in "${SPEC_IPS[@]}"; do
+  if ! printf '%s\n' "${ASSIGNED[@]:-}" | grep -qx "$ip"; then
+    MISSING+=("$ip")
+  fi
+done
+
+case ${#MISSING[@]} in
+  0)
+    log "Toutes les IP sont assignées, rien à faire."
+    exit 0
+    ;;
+  1)
+    log "CAS 1 : une seule IP non assignée : ${MISSING[0]}"
+    repair_ip "${MISSING[0]}" || exit 1
+    ;;
+  *)
+    log "CAS 2 : ${#MISSING[@]} IP non assignées : ${MISSING[*]}"
+    # Chaque IP est traitée l'une après l'autre
+    rc=0
+    for ip in "${MISSING[@]}"; do
+      repair_ip "$ip" || rc=1
+    done
+    (( rc )) && log "Au moins une réparation a échoué."
+    ;;
+esac
+
+# Vérification finale
+if (( DRY_RUN )); then
+  log "Dry-run terminé, aucune modification effectuée."
+  exit 0
+fi
+
+log "=== Vérification finale ==="
+sleep 3
+final_rc=0
+for ip in "${SPEC_IPS[@]}"; do
+  node=$(get_assigned_node "$ip")
+  if [[ -n "$node" ]]; then
+    log "  OK   $ip -> $node"
+  else
+    err "  KO   $ip non assignée"
+    final_rc=1
+  fi
+done
+exit $final_rc
