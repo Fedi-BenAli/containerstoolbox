@@ -1,0 +1,27 @@
+  validateHealths:
+    - name: clusterissuer-ready
+      featureID: Resources        # Helm | Resources | Kustomize, depending on how you deploy it
+      group: cert-manager.io
+      version: v1
+      kind: ClusterIssuer
+      script: |
+        function evaluate()
+          local hs = {}
+          hs.healthy = false
+          hs.message = "ClusterIssuer " .. obj.metadata.name .. ": Ready condition not found"
+
+          if obj.status ~= nil and obj.status.conditions ~= nil then
+            for _, c in ipairs(obj.status.conditions) do
+              if c.type == "Ready" then
+                if c.status == "True" then
+                  hs.healthy = true
+                  hs.message = ""
+                else
+                  hs.message = "ClusterIssuer " .. obj.metadata.name .. " not ready: " .. (c.reason or "") .. " " .. (c.message or "")
+                end
+              end
+            end
+          end
+
+          return hs
+        end
