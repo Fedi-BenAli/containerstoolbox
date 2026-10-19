@@ -1,0 +1,30 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sveltos-cluster-manager
+rules:
+  # Sveltos-managed clusters
+  - apiGroups: ["lib.projectsveltos.io"]
+    resources: ["sveltosclusters"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  # Cluster API clusters
+  - apiGroups: ["cluster.x-k8s.io"]
+    resources: ["clusters"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  # ClusterSummary: read-only, including status
+  - apiGroups: ["config.projectsveltos.io"]
+    resources: ["clustersummaries", "clustersummaries/status"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sveltos-cluster-manager
+subjects:
+  - kind: ServiceAccount
+    name: <service-account-name>
+    namespace: <service-account-namespace>
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sveltos-cluster-manager
