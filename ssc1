@@ -1,0 +1,31 @@
+import re
+from kubernetes import client, config
+
+VERSIONED = re.compile(r"^(?P<prefix>.+)-v?(?P<version>\d+(?:\.\d+)+)$")
+
+
+def get_clusterprofile_name(name: str) -> str:
+    """Exact name -> returned as is. Prefix -> latest '<prefix>-<version>'."""
+    try:
+        config.load_kube_config()
+    except config.ConfigException:
+        config.load_incluster_config()
+
+    items = client.CustomObjectsApi().list_cluster_custom_object(
+        "config.projectsveltos.io", "v1beta1", "clusterprofiles"
+    )["items"]
+    names = [i["metadata"]["name"] for i in items]
+
+    if name in names:  # non-versioned profiles
+        return name
+
+    matches = []
+    for n in names:
+        m = VERSIONED.match(n)
+        if m and m["prefix"] == name:
+            matches.append((tuple(map(int, m["version"].split("."))), n))
+
+    if not matches:
+        raise LookupError(f"No ClusterProfile found for '{name}'")
+
+    return max(matches)[1]  # highest version
