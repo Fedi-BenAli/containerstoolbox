@@ -111,6 +111,44 @@
               end
             end
           end
+-----------------------
+
+
+  validateHealths:
+    - name: openbao-initialized-unsealed
+      featureID: Resources     # the 2nd profile deploys the job through policyRefs
+      group: apps
+      version: v1
+      kind: StatefulSet
+      namespace: openbao
+      script: |
+        function evaluate()
+          local hs = {}
+          hs.healthy = false
+
+          if obj.metadata.name ~= "openbao" then
+            hs.healthy = true
+            return hs
+          end
+
+          local expected = 3
+          local desired = 0
+          local ready = 0
+          if obj.spec ~= nil and obj.spec.replicas ~= nil then
+            desired = obj.spec.replicas
+          end
+          if obj.status ~= nil then
+            ready = obj.status.readyReplicas or 0
+          end
+
+          if desired ~= expected then
+            hs.message = "openbao: spec.replicas is " .. desired .. ", expected " .. expected
+          elseif ready ~= expected then
+            hs.message = "openbao: " .. ready .. "/" .. expected .. " pods ready (not initialized or not unsealed yet)"
+          else
+            hs.healthy = true
+            hs.message = ""
+          end
 
           return hs
         end
