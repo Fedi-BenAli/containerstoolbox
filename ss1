@@ -1,0 +1,76 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-script
+  namespace: my-namespace
+data:
+  script.py: |
+    import os
+    import yaml
+
+    namespace = os.environ["NAMESPACE"]
+    cluster_name = os.environ["CLUSTER_NAME"]
+    job_type = os.environ["TYPE"]
+
+    with open("/config/phases.yaml") as f:
+        phases = yaml.safe_load(f)
+
+    print(f"namespace={namespace} cluster={cluster_name} type={job_type}")
+    print(phases)
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-phases
+  namespace: my-namespace
+data:
+  phases.yaml: |
+    phases:
+      - name: prepare
+        order: 1
+      - name: run
+        order: 2
+      - name: cleanup
+        order: 3
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: my-python-job
+  namespace: my-namespace
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: runner
+          image: python:3.12-slim
+          command: ["sh", "-c"]
+          args:
+            - pip install --no-cache-dir pyyaml && python /scripts/script.py
+          env:
+            - name: NAMESPACE
+              value: "my-namespace"
+              # or take it from the pod's actual namespace:
+              # valueFrom:
+              #   fieldRef:
+              #     fieldPath: metadata.namespace
+            - name: CLUSTER_NAME
+              value: "my-cluster"
+            - name: TYPE
+              value: "full"
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+            - name: phases
+              mountPath: /config
+      volumes:
+        - name: script
+          configMap:
+            name: my-script
+            defaultMode: 0555
+        - name: phases
+          configMap:
+            name: my-phases
